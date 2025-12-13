@@ -1,4 +1,5 @@
 import os
+import re
 from glob import glob
 from typing import List, Optional
 
@@ -22,6 +23,38 @@ def list_data_files(
     return sorted(files)
 
 
+def _pick_latest_symbol_file(files: List[str], symbol_filter: Optional[str]) -> Optional[str]:
+    """
+    Prefer the latest timestamped file like BTC_USD_YYYYMMDD_HHMMSS.csv.
+    Falls back to the last sorted match if pattern isn't present.
+    """
+    if not files:
+        return None
+
+    if not symbol_filter:
+        # No symbol filter => keep previous behavior (combine all)
+        return None
+
+    # Match: SYMBOL_20251210_114738.csv
+    # Capture groups: date(YYYYMMDD), time(HHMMSS)
+    rx = re.compile(rf"^{re.escape(symbol_filter)}_(\d{{8}})_(\d{{6}})\.csv$")
+
+    best = None
+    best_key = None
+
+    for path in files:
+        name = os.path.basename(path)
+        m = rx.match(name)
+        if m:
+            key = (m.group(1), m.group(2))  # (date, time) as strings, sortable
+            if best_key is None or key > best_key:
+                best_key = key
+                best = path
+
+    # If we found a timestamped file, use it; else fall back to last sorted match
+    return best or files[-1]
+
+
 def load_price_data(
     data_dir: str = "data",
     symbol_filter: Optional[str] = None,
@@ -41,8 +74,15 @@ def load_price_data(
             f"No CSV files found in {data_dir} for filter={symbol_filter}"
         )
 
+    # IMPORTANT: in Lambda, we typically want ONE latest file per symbol, not concatenating old snapshots.
+    latest_path = _pick_latest_symbol_file(files, symbol_filter=symbol_filter)
+
+    # If symbol_filter was provided, we load only the latest file (best for speed + correctness)
+    # If symbol_filter is None, preserve prior behavior (combine all CSVs)
+    paths_to_load = [latest_path] if (symbol_filter and latest_path) else files
+
     dfs = []
-    for path in files:
+    for path in paths_to_load:
         df = pd.read_csv(
             path,
             skiprows=2,  # skip "Price,...", "Ticker,..."
