@@ -1,17 +1,17 @@
+# macOS
+.DS_Store
+
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-
-# Virtual env
 .venv/
 venv/
 
-# Env files
-.env
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
 
-# OS / IDE
-.DS_Store
-.vscode/
-.idea/
+# Local build artifacts
+build/

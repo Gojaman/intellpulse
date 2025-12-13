@@ -2,3 +2,6 @@ pandas
 yfinance
 matplotlib
 python-binance
+fastapi==0.124.4
+mangum==0.19.0
+uvicorn
