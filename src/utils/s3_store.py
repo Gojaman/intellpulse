@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
 
 import boto3
 
@@ -16,7 +16,7 @@ def _bucket() -> str:
 
 
 def _key(asset: str, mode: str) -> str:
-    asset_norm = asset.replace("/", "_")
+    asset_norm = asset.replace("/", "_").replace("-", "_")
     return f"signals/latest/{asset_norm}/{mode}.json"
 
 
@@ -33,7 +33,10 @@ def read_latest_signal(asset: str, mode: str) -> Optional[Dict[str, Any]]:
 
 def write_latest_signal(asset: str, mode: str, payload: Dict[str, Any]) -> None:
     payload = dict(payload)
-    payload.setdefault("cached_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    payload.setdefault(
+        "cached_at",
+        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
 
     _s3.put_object(
         Bucket=_bucket(),

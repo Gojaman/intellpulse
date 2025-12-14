@@ -20,11 +20,12 @@ app = FastAPI(title="Intellpulse API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for dev. Later lock to your Vercel/Lovable domain.
-    allow_credentials=False,  # must be False when allow_origins=["*"]
+    allow_origins=["*"],  # dev. later lock to your Vercel/Lovable domain
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------
 # Helpers
@@ -46,7 +47,7 @@ def _load_price_pipeline(asset: str):
 
 
 def _cache_ttl_seconds() -> int:
-    return int(os.getenv("SIGNAL_CACHE_TTL_SECONDS", "900"))  # 15 min default
+    return int(os.getenv("SIGNAL_CACHE_TTL_SECONDS", "900"))  # 15 min
 
 
 def _is_fresh(cached_at_iso: str, ttl_seconds: int) -> bool:
@@ -65,7 +66,7 @@ FNG_URL = "https://api.alternative.me/fng/?limit=1&format=json"
 def _get_fear_greed_score() -> float:
     """
     Returns 0..1 sentiment score derived from Fear & Greed Index (0..100).
-    Fallback to 0.5 if upstream is unavailable (so API never 500s on sentiment fetch).
+    Fallback to 0.5 if upstream is unavailable (avoid 500s).
     """
     try:
         r = httpx.get(FNG_URL, timeout=5.0)
@@ -79,12 +80,10 @@ def _get_fear_greed_score() -> float:
 
 def _load_aligned_sentiment(asset: str, price_df):
     """
-    Create a minimal sentiment series aligned to the same timestamps as price_df.
-    MVP: use ONE live market sentiment value and broadcast it across the index.
+    MVP: one live sentiment value broadcast across all timestamps.
     """
     score = _get_fear_greed_score()
-    sent_aligned = pd.DataFrame(index=price_df.index, data={"sentiment_score": score})
-    return sent_aligned
+    return pd.DataFrame(index=price_df.index, data={"sentiment_score": score})
 
 
 # -------------------------
@@ -107,7 +106,7 @@ class SignalResponse(BaseModel):
     latest_signal: int
     latest_signal_text: Literal["BUY", "HOLD", "SELL"]
     latest_sentiment: Optional[float] = None
-    cached_at_utc: Optional[str] = None  # added for transparency
+    cached_at_utc: Optional[str] = None
 
 
 class ExplainRequest(BaseModel):
@@ -129,7 +128,6 @@ def health():
 
 @app.get("/sentiment/latest")
 def sentiment_latest():
-    """Simple endpoint so UI can show live sentiment directly."""
     score = _get_fear_greed_score()
     return {"source": "alternative.me_fng", "score": score}
 
@@ -139,18 +137,26 @@ def get_signal(
     asset: str = "BTC-USD",
     mode: Literal["price_only", "combined"] = "combined",
 ):
-    # 1) Read cache first
-    try:
-        cached = read_latest_signal(asset, mode)
-        if cached and _is_fresh(cached.get("cached_at_utc", ""), _cache_ttl_seconds()):
-            return SignalResponse(**cached)
-    except Exception:
-        # Cache should never break the endpoint
-        pass
+    ttl = _cache_ttl_seconds()
 
-    # 2) Compute
+    # 1) Try cache (only if env is set)
+    if os.getenv("SIGNALS_BUCKET"):
+        cached = read_latest_signal(asset=asset, mode=mode)
+        if cached and _is_fresh(cached.get("cached_at", ""), ttl):
+            print(f"DEBUG — cache HIT for {asset} {mode}")
+            return SignalResponse(
+                asset=asset,
+                mode=mode,
+                latest_timestamp=cached["latest_timestamp"],
+                latest_signal=int(cached["latest_signal"]),
+                latest_signal_text=_signal_to_text(int(cached["latest_signal"])),
+                latest_sentiment=cached.get("latest_sentiment"),
+                cached_at_utc=cached.get("cached_at"),
+            )
+        print(f"DEBUG — cache MISS for {asset} {mode}")
+
+    # 2) Compute fresh
     price_sig = _load_price_pipeline(asset)
-
     latest_ts = price_sig.index[-1]
     latest_signal = int(price_sig["signal"].iloc[-1])
     latest_sentiment: Optional[float] = None
@@ -161,6 +167,8 @@ def get_signal(
         latest_signal = int(combined["signal_combined"].iloc[-1])
         latest_sentiment = float(combined["sentiment_score"].iloc[-1])
 
+    cached_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     resp = SignalResponse(
         asset=asset,
         mode=mode,
@@ -168,16 +176,27 @@ def get_signal(
         latest_signal=latest_signal,
         latest_signal_text=_signal_to_text(latest_signal),
         latest_sentiment=latest_sentiment,
-        cached_at_utc=datetime.now(timezone.utc).isoformat(),
+        cached_at_utc=cached_at,
     )
 
-    # 3) Write cache (best-effort)
-    try:
-        write_latest_signal(resp.model_dump())
-    except Exception:
-        pass
+    # 3) Write cache
+    if os.getenv("SIGNALS_BUCKET"):
+        write_latest_signal(
+            asset=asset,
+            mode=mode,
+            payload={
+                "asset": resp.asset,
+                "mode": resp.mode,
+                "latest_timestamp": resp.latest_timestamp,
+                "latest_signal": resp.latest_signal,
+                "latest_sentiment": resp.latest_sentiment,
+                "cached_at": cached_at,
+            },
+        )
+        print(f"DEBUG — cache WRITE for {asset} {mode} at {cached_at}")
 
     return resp
+
 
 
 @app.post("/signal/explain", response_model=ExplainResponse)
