@@ -1,21 +1,17 @@
 from __future__ import annotations
 from mangum import Mangum
 
-import os
 from typing import Literal, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+import pandas as pd
+import httpx
+
 from src.utils.data_loader import load_price_data
 from src.features.price_features import build_price_feature_set
 from src.models.signal_engine import generate_rule_based_signal, generate_combined_signal
-from src.ingestion.sentiment_ingestion import load_sentiment_csv
-from src.features.sentiment_features import (
-    apply_sentiment_scorer,
-    aggregate_sentiment_to_prices,
-    get_sentiment_scorer,
-)
 
 app = FastAPI(title="Intellpulse API", version="0.2.0")
 
@@ -23,12 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # for dev. Later you can lock this to your Lovable domain.
-    allow_credentials=False,       # must be False when allow_origins=["*"]
+    allow_origins=["*"],          # for dev. Later lock to your Vercel/Lovable domain.
+    allow_credentials=False,      # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 
 # -------------------------
@@ -50,12 +45,27 @@ def _load_price_pipeline(asset: str):
     return price_sig
 
 
+# --- LIVE SENTIMENT (Fear & Greed Index) ---
+FNG_URL = "https://api.alternative.me/fng/?limit=1&format=json"
+
+def _get_fear_greed_score() -> float:
+    """
+    Returns 0..1 sentiment score derived from Fear & Greed Index (0..100).
+    """
+    r = httpx.get(FNG_URL, timeout=5.0)
+    r.raise_for_status()
+    data = r.json()
+    value_0_100 = float(data["data"][0]["value"])
+    return max(0.0, min(1.0, value_0_100 / 100.0))
+
+
 def _load_aligned_sentiment(asset: str, price_df):
-    path = os.getenv("SENTIMENT_CSV_PATH", "data/sentiment_sample.csv")
-    sent_raw = load_sentiment_csv(path, asset_filter=asset)
-    scorer = get_sentiment_scorer()  # naive or claude (env-controlled)
-    sent_scored = apply_sentiment_scorer(sent_raw, scorer=scorer)
-    sent_aligned = aggregate_sentiment_to_prices(sent_scored, price_df)
+    """
+    Create a minimal sentiment series aligned to the same timestamps as price_df.
+    For MVP: use ONE live market sentiment value and broadcast it across the index.
+    """
+    score = _get_fear_greed_score()
+    sent_aligned = pd.DataFrame(index=price_df.index, data={"sentiment_score": score})
     return sent_aligned
 
 
@@ -98,12 +108,13 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/sentiment/score", response_model=SentimentScoreResponse)
-def sentiment_score(req: SentimentScoreRequest):
-    scorer = get_sentiment_scorer()
-    score = float(scorer(req.text))
-    score = max(0.0, min(1.0, score))
-    return SentimentScoreResponse(score=score, engine=os.getenv("SENTIMENT_ENGINE", "naive"))
+@app.get("/sentiment/latest")
+def sentiment_latest():
+    """
+    Simple endpoint so UI can show live sentiment directly.
+    """
+    score = _get_fear_greed_score()
+    return {"source": "alternative.me_fng", "score": score}
 
 
 @app.get("/signal", response_model=SignalResponse)
@@ -135,7 +146,6 @@ def get_signal(
 
 @app.post("/signal/explain", response_model=ExplainResponse)
 def explain_signal(req: ExplainRequest):
-    # Pull the same “latest” values used by /signal
     price_sig = _load_price_pipeline(req.asset)
     latest_ts = price_sig.index[-1]
     price_signal = int(price_sig["signal"].iloc[-1])
@@ -153,17 +163,17 @@ def explain_signal(req: ExplainRequest):
         sentiment = float(combined["sentiment_score"].iloc[-1])
 
         explanation_parts += [
-            f"Sentiment score (aligned): {sentiment:.2f} (0..1)",
+            f"Sentiment score (live, 0..1): {sentiment:.2f}",
             f"Combined signal: {_signal_to_text(combined_signal)} ({combined_signal})",
-            "Logic: combined signal adjusts the price-model signal using recent sentiment strength.",
+            "Logic: combined signal adjusts the price-model signal using current market sentiment.",
         ]
     else:
         explanation_parts += [
             "Mode: price_only",
             "Logic: signal is derived strictly from price features (no sentiment adjustment).",
-        ] 
+        ]
 
     return ExplainResponse(explanation="\n".join(explanation_parts))
 
-handler = Mangum(app)
 
+handler = Mangum(app)
