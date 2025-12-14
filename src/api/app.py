@@ -178,6 +178,7 @@ def get_signal(
         latest_sentiment=latest_sentiment,
         cached_at_utc=cached_at,
     )
+    print("DEBUG — attempting cache write")
 
     # 3) Write cache
     if os.getenv("SIGNALS_BUCKET"):
@@ -196,7 +197,7 @@ def get_signal(
         print(f"DEBUG — cache WRITE for {asset} {mode} at {cached_at}")
 
     return resp
-    
+
 @app.get("/debug/cache")
 def debug_cache(asset: str = "BTC-USD", mode: str = "combined"):
     bucket = os.getenv("SIGNALS_BUCKET")
