@@ -11,6 +11,10 @@ variable "project_name" {
 }
 
 variable "image_uri" {
-  description = "ECR image URI including tag (e.g. 123.dkr.ecr.us-east-1.amazonaws.com/intellpulse-api:latest)"
+  description = "ECR image URI including tag"
   type        = string
 }
+
+# Optional safety: force you to pass TF_VAR_image_uri or -var
+# (no default on purpose)
+

@@ -196,7 +196,19 @@ def get_signal(
         print(f"DEBUG — cache WRITE for {asset} {mode} at {cached_at}")
 
     return resp
-
+    
+@app.get("/debug/cache")
+def debug_cache(asset: str = "BTC-USD", mode: str = "combined"):
+    bucket = os.getenv("SIGNALS_BUCKET")
+    ttl = _cache_ttl_seconds()
+    return {
+        "signals_bucket_env": bucket,
+        "ttl_seconds": ttl,
+        "asset": asset,
+        "mode": mode,
+        "key_expected_dash": f"signals/latest/{asset}/{mode}.json",
+        "key_expected_us": f"signals/latest/{asset.replace('-','_')}/{mode}.json",
+    }
 
 
 @app.post("/signal/explain", response_model=ExplainResponse)

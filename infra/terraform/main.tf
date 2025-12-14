@@ -5,13 +5,11 @@ locals {
   name = var.project_name
 }
 
-# --- ECR repo to store the Lambda container image ---
 resource "aws_ecr_repository" "api" {
   name         = "${var.project_name}-api"
   force_delete = true
 }
 
-# --- IAM for Lambda ---
 resource "aws_iam_role" "lambda_role" {
   name = "${local.name}-lambda-role"
 
@@ -30,9 +28,6 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# -------------------------
-# S3 bucket for signals
-# -------------------------
 resource "aws_s3_bucket" "signals" {
   bucket = "intellpulse-signals-${data.aws_caller_identity.current.account_id}-${data.aws_region.current.name}"
 }
@@ -55,9 +50,6 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "signals" {
   }
 }
 
-# -------------------------
-# IAM permission for Lambda to write/read signals
-# -------------------------
 resource "aws_iam_policy" "lambda_s3_signals" {
   name        = "intellpulse-lambda-s3-signals"
   description = "Allow Lambda to put/get/list signal objects in the signals bucket"
@@ -86,7 +78,6 @@ resource "aws_iam_role_policy_attachment" "lambda_attach_signals_policy" {
   policy_arn = aws_iam_policy.lambda_s3_signals.arn
 }
 
-# --- Lambda (Container Image) ---
 resource "aws_lambda_function" "api" {
   function_name = "${local.name}-api"
   role          = aws_iam_role.lambda_role.arn
@@ -100,14 +91,11 @@ resource "aws_lambda_function" "api" {
   environment {
     variables = {
       SIGNALS_BUCKET           = aws_s3_bucket.signals.bucket
-      SIGNALS_PREFIX           = "latest"
       SIGNAL_CACHE_TTL_SECONDS = "900"
     }
   }
 }
 
-
-# --- API Gateway HTTP API ---
 resource "aws_apigatewayv2_api" "http_api" {
   name          = "${local.name}-http-api"
   protocol_type = "HTTP"
