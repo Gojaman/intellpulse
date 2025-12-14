@@ -6,40 +6,24 @@ env:
     AWS_REGION: "us-east-1"
     REPO_NAME: "intellpulse-api"
     IMAGE_TAG: "latest"
-    FN: "intellpulse-api"
 
 phases:
   pre_build:
     commands:
       - set -e
-      - echo "Logging in to Amazon ECR..."
+      - echo Logging in to Amazon ECR...
       - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
   build:
     commands:
       - set -e
-      - echo "Building Docker image..."
+      - echo Build started on $(date)
       - docker build -t "${REPO_NAME}:${IMAGE_TAG}" .
       - docker tag "${REPO_NAME}:${IMAGE_TAG}" "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}"
 
   post_build:
     commands:
       - set -e
-      - echo "Pushing Docker image to ECR..."
+      - echo Pushing the Docker image...
       - docker push "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}"
-
-      - echo "Resolving latest image digest..."
-      - DIGEST=$(aws ecr describe-images --repository-name "$REPO_NAME" --region "$AWS_REGION" --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageDigest' --output text)
-      - echo "Latest digest: $DIGEST"
-
-      - echo "Updating Lambda to use digest..."
-      - aws lambda update-function-code --function-name "$FN" --region "$AWS_REGION" --image-uri "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}@${DIGEST}"
-
-      - echo "Waiting for Lambda update..."
-      - aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION"
-      - echo "✅ Deploy complete"
-
-artifacts:
-  files:
-    - "**/*"
-  discard-paths: yes
+      - echo Build completed on $(date)
