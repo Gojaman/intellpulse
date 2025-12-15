@@ -6,7 +6,9 @@ env:
     AWS_ACCOUNT_ID: "528757798791"
     REPO_NAME: "intellpulse-api"
     IMAGE_TAG: "latest"
-    FN: "intellpulse-api"
+    STG_FN: "intellpulse-api-staging"
+    STG_URL: "https://hrimhqter7wxdiwzcwiwmo5ubu0xplqb.lambda-url.us-east-1.on.aws"
+    PROD_FN: "intellpulse-api"
 
 phases:
   pre_build:
@@ -27,9 +29,22 @@ phases:
       - "set -eu"
       - "echo \"Pushing image to ECR...\""
       - "docker push \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG\""
-      - "echo \"Updating Lambda to the newly pushed image digest...\""
       - "DIGEST=$(aws ecr describe-images --region \"$AWS_REGION\" --repository-name \"$REPO_NAME\" --image-ids imageTag=\"$IMAGE_TAG\" --query \"imageDetails[0].imageDigest\" --output text)"
       - "echo \"New digest: $DIGEST\""
-      - "aws lambda update-function-code --function-name \"$FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
-      - "aws lambda wait function-updated --function-name \"$FN\" --region \"$AWS_REGION\""
-      - "aws lambda get-function --function-name \"$FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text"
+
+      - "echo \"Deploying to STAGING: $STG_FN\""
+      - "STG_PREV_URI=$(aws lambda get-function --function-name \"$STG_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text)"
+      - "echo \"STAGING_PREVIOUS_IMAGE_URI=$STG_PREV_URI\""
+      - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
+      - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
+
+      - "echo \"Health check staging: $STG_URL/health\""
+      - "curl -fsS \"$STG_URL/health\""
+      - "echo \"Staging health OK\""
+
+      - "echo \"Deploying to PROD: $PROD_FN\""
+      - "PROD_PREV_URI=$(aws lambda get-function --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text)"
+      - "echo \"PROD_PREVIOUS_IMAGE_URI=$PROD_PREV_URI\""
+      - "aws lambda update-function-code --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
+      - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"
+      - "aws lambda get-function --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text"
