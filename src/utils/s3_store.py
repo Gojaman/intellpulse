@@ -20,28 +20,29 @@ def _key(asset: str, mode: str) -> str:
     return f"signals/latest/{asset_norm}/{mode}.json"
 
 
+
 def read_latest_signal(asset: str, mode: str) -> Optional[Dict[str, Any]]:
     try:
         obj = _s3.get_object(Bucket=_bucket(), Key=_key(asset, mode))
         body = obj["Body"].read().decode("utf-8")
         return json.loads(body)
     except _s3.exceptions.NoSuchKey:
+        print("DEBUG — cache object does not exist")
         return None
-    except Exception:
+    except Exception as e:
+        print(f"ERROR — S3 read failed: {e}")
         return None
 
 
 def write_latest_signal(asset: str, mode: str, payload: Dict[str, Any]) -> None:
-    payload = dict(payload)
-    payload.setdefault(
-        "cached_at",
-        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    )
-
-    _s3.put_object(
-        Bucket=_bucket(),
-        Key=_key(asset, mode),
-        Body=json.dumps(payload).encode("utf-8"),
-        ContentType="application/json",
-        ServerSideEncryption="AES256",
-    )
+    try:
+        _s3.put_object(
+            Bucket=_bucket(),
+            Key=_key(asset, mode),
+            Body=json.dumps(payload).encode("utf-8"),
+            ContentType="application/json",
+            ServerSideEncryption="AES256",
+        )
+        print(f"DEBUG — S3 write OK: {_key(asset, mode)}")
+    except Exception as e:
+        print(f"ERROR — S3 write failed: {e}")

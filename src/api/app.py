@@ -6,7 +6,7 @@ from typing import Literal, Optional
 
 import httpx
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 from pydantic import BaseModel, Field
@@ -16,7 +16,7 @@ from src.models.signal_engine import generate_combined_signal, generate_rule_bas
 from src.utils.data_loader import load_price_data
 from src.utils.s3_store import read_latest_signal, write_latest_signal
 
-app = FastAPI(title="Intellpulse API", version="0.2.0")
+app = FastAPI(title="Intellpulse API", version="0.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +25,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------------
+# API Key protection (MVP)
+# -------------------------
+PUBLIC_PATHS = {"/health"}  # keep public
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    # allow public paths
+    if request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    # read dynamically (Lambda warm start safe)
+    api_key = os.getenv("API_KEY")
+
+    # if API key not configured, allow (dev mode)
+    if not api_key:
+        return await call_next(request)
+
+    sent = request.headers.get("x-api-key")
+    if sent != api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return await call_next(request)
 
 
 # -------------------------
@@ -197,6 +222,7 @@ def get_signal(
         print(f"DEBUG — cache WRITE for {asset} {mode} at {cached_at}")
 
     return resp
+
 
 @app.get("/debug/cache")
 def debug_cache(asset: str = "BTC-USD", mode: str = "combined"):
