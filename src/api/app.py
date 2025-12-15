@@ -8,6 +8,7 @@ import httpx
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse 
 from mangum import Mangum
 from pydantic import BaseModel, Field
 
@@ -31,14 +32,13 @@ app.add_middleware(
 # -------------------------
 PUBLIC_PATHS = {"/health"}  # keep public
 
-
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     # allow public paths
     if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
 
-    # read dynamically (Lambda warm start safe)
+    # read key at request-time (so env updates don't require a cold start)
     api_key = os.getenv("API_KEY")
 
     # if API key not configured, allow (dev mode)
@@ -47,7 +47,7 @@ async def api_key_middleware(request: Request, call_next):
 
     sent = request.headers.get("x-api-key")
     if sent != api_key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        return JSONResponse({"detail": "Invalid API key"}, status_code=401)
 
     return await call_next(request)
 
