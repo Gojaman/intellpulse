@@ -11,25 +11,25 @@ env:
 phases:
   pre_build:
     commands:
-      - set -euo pipefail
-      - echo "Logging in to ECR..."
-      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+      - "set -euo pipefail"
+      - "echo \"Logging in to ECR...\""
+      - "aws ecr get-login-password --region \"$AWS_REGION\" | docker login --username AWS --password-stdin \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com\""
 
   build:
     commands:
-      - set -euo pipefail
-      - echo "Building Docker image..."
-      - docker build -t "$REPO_NAME:$IMAGE_TAG" .
-      - docker tag "$REPO_NAME:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
+      - "set -euo pipefail"
+      - "echo \"Building Docker image...\""
+      - "docker build -t \"$REPO_NAME:$IMAGE_TAG\" ."
+      - "docker tag \"$REPO_NAME:$IMAGE_TAG\" \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG\""
 
   post_build:
     commands:
-      - set -euo pipefail
-      - echo "Pushing image to ECR..."
-      - docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
-      - echo "Updating Lambda to the newly pushed image digest..."
-      - DIGEST="$(aws ecr describe-images --region "$AWS_REGION" --repository-name "$REPO_NAME" --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
-      - echo "New digest: $DIGEST"
-      - aws lambda update-function-code --function-name "$FN" --region "$AWS_REGION" --image-uri "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST"
-      - aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION"
-      - aws lambda get-function --function-name "$FN" --region "$AWS_REGION" --query 'Code.ImageUri' --output text
+      - "set -euo pipefail"
+      - "echo \"Pushing image to ECR...\""
+      - "docker push \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG\""
+      - "echo \"Updating Lambda to the newly pushed image digest...\""
+      - "DIGEST=$(aws ecr describe-images --region \"$AWS_REGION\" --repository-name \"$REPO_NAME\" --image-ids imageTag=\"$IMAGE_TAG\" --query \"imageDetails[0].imageDigest\" --output text)"
+      - "echo \"New digest: $DIGEST\""
+      - "aws lambda update-function-code --function-name \"$FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
+      - "aws lambda wait function-updated --function-name \"$FN\" --region \"$AWS_REGION\""
+      - "aws lambda get-function --function-name \"$FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text"
