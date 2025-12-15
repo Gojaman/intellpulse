@@ -11,20 +11,20 @@ env:
 phases:
   pre_build:
     commands:
-      - "set -euo pipefail"
+      - "set -eu"
       - "echo \"Logging in to ECR...\""
       - "aws ecr get-login-password --region \"$AWS_REGION\" | docker login --username AWS --password-stdin \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com\""
 
   build:
     commands:
-      - "set -euo pipefail"
+      - "set -eu"
       - "echo \"Building Docker image...\""
       - "docker build -t \"$REPO_NAME:$IMAGE_TAG\" ."
       - "docker tag \"$REPO_NAME:$IMAGE_TAG\" \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG\""
 
   post_build:
     commands:
-      - "set -euo pipefail"
+      - "set -eu"
       - "echo \"Pushing image to ECR...\""
       - "docker push \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG\""
       - "echo \"Updating Lambda to the newly pushed image digest...\""
