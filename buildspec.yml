@@ -37,11 +37,12 @@ phases:
       - "echo \"STAGING_PREVIOUS_IMAGE_URI=$STG_PREV_URI\""
       - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
-
-      - "echo \"Health check staging: $STG_URL/health\""
-      - "curl -fsS \"$STG_URL/health\""
-      - "echo \"Staging health OK\""
-
+      - "echo \"Staging smoke test: /signal\""
+      - "RESP=$(curl -fsS \"$STG_URL/signal?asset=BTC-USD&mode=combined\")"
+      - "echo \"$RESP\""
+      - "echo \"$RESP\" | grep -q '\"latest_signal_text\"' "
+      - "echo \"$RESP\" | grep -q '\"asset\":\"BTC-USD\"' "
+      - "echo \"Staging smoke test OK\""
       - "echo \"Deploying to PROD: $PROD_FN\""
       - "PROD_PREV_URI=$(aws lambda get-function --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text)"
       - "echo \"PROD_PREVIOUS_IMAGE_URI=$PROD_PREV_URI\""
