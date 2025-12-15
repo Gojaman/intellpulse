@@ -36,6 +36,7 @@ phases:
       - "echo \"Deploying to STAGING: $STG_FN\""
       - "STG_PREV_URI=$(aws lambda get-function --function-name \"$STG_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text)"
       - "echo \"STAGING_PREVIOUS_IMAGE_URI=$STG_PREV_URI\""
+      - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
       - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
@@ -49,6 +50,7 @@ phases:
       - "echo \"Deploying to PROD: $PROD_FN\""
       - "PROD_PREV_URI=$(aws lambda get-function --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text)"
       - "echo \"PROD_PREVIOUS_IMAGE_URI=$PROD_PREV_URI\""
+      - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"
       - "aws lambda update-function-code --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
       - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"
       - "aws lambda get-function --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text"
