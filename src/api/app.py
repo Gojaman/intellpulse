@@ -4,20 +4,21 @@ import os
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
+import boto3
 import httpx
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse 
+from fastapi.responses import JSONResponse
 from mangum import Mangum
 from pydantic import BaseModel, Field
 
 from src.features.price_features import build_price_feature_set
 from src.models.signal_engine import generate_combined_signal, generate_rule_based_signal
 from src.utils.data_loader import load_price_data
-from src.utils.s3_store import read_latest_signal, write_latest_signal
+from src.utils.s3_store import cache_bucket, cache_key, read_latest_signal, write_latest_signal
 
-app = FastAPI(title="Intellpulse API", version="0.2.2")
+app = FastAPI(title="Intellpulse API", version="0.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,17 +33,14 @@ app.add_middleware(
 # -------------------------
 PUBLIC_PATHS = {"/health"}  # keep public
 
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    # allow public paths
     if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
 
-    # read key at request-time (so env updates don't require a cold start)
-    api_key = os.getenv("API_KEY")
-
-    # if API key not configured, allow (dev mode)
-    if not api_key:
+    api_key = os.getenv("API_KEY")  # read at request-time
+    if not api_key:  # dev mode
         return await call_next(request)
 
     sent = request.headers.get("x-api-key")
@@ -50,6 +48,33 @@ async def api_key_middleware(request: Request, call_next):
         return JSONResponse({"detail": "Invalid API key"}, status_code=401)
 
     return await call_next(request)
+
+
+# -------------------------
+# Observability (CloudWatch)
+# -------------------------
+_cw = boto3.client("cloudwatch")
+
+
+def _emit_metric(name: str, value: float, unit: str = "Count") -> None:
+    """
+    Best-effort metric emission. Never breaks the request path.
+    """
+    try:
+        fn = os.getenv("AWS_LAMBDA_FUNCTION_NAME", "unknown")
+        _cw.put_metric_data(
+            Namespace="Intellpulse",
+            MetricData=[
+                {
+                    "MetricName": name,
+                    "Value": value,
+                    "Unit": unit,
+                    "Dimensions": [{"Name": "Function", "Value": fn}],
+                }
+            ],
+        )
+    except Exception:
+        pass
 
 
 # -------------------------
@@ -75,13 +100,19 @@ def _cache_ttl_seconds() -> int:
     return int(os.getenv("SIGNAL_CACHE_TTL_SECONDS", "900"))  # 15 min
 
 
-def _is_fresh(cached_at_iso: str, ttl_seconds: int) -> bool:
+def _age_seconds(cached_at_iso: str) -> Optional[float]:
     try:
         dt = datetime.fromisoformat(cached_at_iso.replace("Z", "+00:00"))
-        age = (datetime.now(timezone.utc) - dt).total_seconds()
-        return age <= ttl_seconds
+        return (datetime.now(timezone.utc) - dt).total_seconds()
     except Exception:
+        return None
+
+
+def _is_fresh(cached_at_iso: str, ttl_seconds: int) -> bool:
+    age = _age_seconds(cached_at_iso)
+    if age is None:
         return False
+    return age <= ttl_seconds
 
 
 # --- LIVE SENTIMENT (Fear & Greed Index) ---
@@ -104,9 +135,6 @@ def _get_fear_greed_score() -> float:
 
 
 def _load_aligned_sentiment(asset: str, price_df):
-    """
-    MVP: one live sentiment value broadcast across all timestamps.
-    """
     score = _get_fear_greed_score()
     return pd.DataFrame(index=price_df.index, data={"sentiment_score": score})
 
@@ -168,7 +196,7 @@ def get_signal(
     if os.getenv("SIGNALS_BUCKET"):
         cached = read_latest_signal(asset=asset, mode=mode)
         if cached and _is_fresh(cached.get("cached_at", ""), ttl):
-            print(f"DEBUG — cache HIT for {asset} {mode}")
+            _emit_metric("cache_hit", 1)
             return SignalResponse(
                 asset=asset,
                 mode=mode,
@@ -178,7 +206,7 @@ def get_signal(
                 latest_sentiment=cached.get("latest_sentiment"),
                 cached_at_utc=cached.get("cached_at"),
             )
-        print(f"DEBUG — cache MISS for {asset} {mode}")
+        _emit_metric("cache_miss", 1)
 
     # 2) Compute fresh
     price_sig = _load_price_pipeline(asset)
@@ -203,23 +231,25 @@ def get_signal(
         latest_sentiment=latest_sentiment,
         cached_at_utc=cached_at,
     )
-    print("DEBUG — attempting cache write")
 
-    # 3) Write cache
+    # 3) Write cache (best effort)
     if os.getenv("SIGNALS_BUCKET"):
-        write_latest_signal(
-            asset=asset,
-            mode=mode,
-            payload={
-                "asset": resp.asset,
-                "mode": resp.mode,
-                "latest_timestamp": resp.latest_timestamp,
-                "latest_signal": resp.latest_signal,
-                "latest_sentiment": resp.latest_sentiment,
-                "cached_at": cached_at,
-            },
-        )
-        print(f"DEBUG — cache WRITE for {asset} {mode} at {cached_at}")
+        try:
+            write_latest_signal(
+                asset=asset,
+                mode=mode,
+                payload={
+                    "asset": resp.asset,
+                    "mode": resp.mode,
+                    "latest_timestamp": resp.latest_timestamp,
+                    "latest_signal": resp.latest_signal,
+                    "latest_sentiment": resp.latest_sentiment,
+                    "cached_at": cached_at,
+                },
+            )
+            _emit_metric("cache_write_ok", 1)
+        except Exception:
+            _emit_metric("cache_write_err", 1)
 
     return resp
 
@@ -227,14 +257,53 @@ def get_signal(
 @app.get("/debug/cache")
 def debug_cache(asset: str = "BTC-USD", mode: str = "combined"):
     bucket = os.getenv("SIGNALS_BUCKET")
-    ttl = _cache_ttl_seconds()
     return {
         "signals_bucket_env": bucket,
-        "ttl_seconds": ttl,
+        "bucket_effective": bucket or None,
+        "key_effective": cache_key(asset, mode) if bucket else None,
+        "ttl_seconds": _cache_ttl_seconds(),
         "asset": asset,
         "mode": mode,
-        "key_expected_dash": f"signals/latest/{asset}/{mode}.json",
-        "key_expected_us": f"signals/latest/{asset.replace('-','_')}/{mode}.json",
+    }
+
+
+@app.get("/debug/cache/read")
+def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
+    """
+    Returns the raw cached JSON (if present) + age/freshness.
+    """
+    bucket_env = os.getenv("SIGNALS_BUCKET")
+    if not bucket_env:
+        return {"enabled": False, "reason": "SIGNALS_BUCKET not set"}
+
+    ttl = _cache_ttl_seconds()
+    key = cache_key(asset, mode)
+    bucket = cache_bucket()
+
+    cached = read_latest_signal(asset=asset, mode=mode)
+    if not cached:
+        return {
+            "enabled": True,
+            "found": False,
+            "bucket": bucket,
+            "key": key,
+            "ttl_seconds": ttl,
+        }
+
+    cached_at = cached.get("cached_at", "")
+    age = _age_seconds(cached_at) if cached_at else None
+    fresh = _is_fresh(cached_at, ttl) if cached_at else False
+
+    return {
+        "enabled": True,
+        "found": True,
+        "bucket": bucket,
+        "key": key,
+        "ttl_seconds": ttl,
+        "cached_at": cached_at,
+        "age_seconds": age,
+        "fresh": fresh,
+        "payload": cached,
     }
 
 
