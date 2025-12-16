@@ -267,8 +267,17 @@ def get_signal(
         bucket = None
         cached = None
 
-    if cached and _is_fresh(cached.get("cached_at", ""), ttl) and explain != 1:
+    # Cache age/freshness instrumentation (best effort)
+    cached_at_val = cached.get("cached_at", "") if cached else ""
+    age = _age_seconds(cached_at_val) if cached else None
+    fresh = _is_fresh(cached_at_val, ttl) if cached else False
+
+    if cached and fresh and explain != 1:
         _emit_metric("CacheHit", 1, asset=asset, mode=mode)
+        if age is not None:
+            _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
+        _emit_metric("CacheFresh", 1, unit="Count", asset=asset, mode=mode)
+
         _emit_metric(
             "SignalLatencyMs",
             (time.time() - t0) * 1000,
@@ -289,6 +298,9 @@ def get_signal(
         )
 
     _emit_metric("CacheMiss", 1, asset=asset, mode=mode)
+    _emit_metric("CacheFresh", 0, unit="Count", asset=asset, mode=mode)
+    if cached and age is not None:
+        _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
 
     # Compute (and handle missing price data cleanly)
     price_sig = _load_price_pipeline(asset)
