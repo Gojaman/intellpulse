@@ -102,6 +102,90 @@ def _is_fresh(iso: str, ttl: int) -> bool:
     age = _age_seconds(iso)
     return age is not None and age <= ttl
 
+def _dump(model_obj) -> dict:
+    """
+    Pydantic v2: model_dump()
+    Pydantic v1: dict()
+    """
+    if model_obj is None:
+        return {}
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    if hasattr(model_obj, "dict"):
+        return model_obj.dict()
+    return dict(model_obj)
+
+def _extract_latest_features(df: pd.DataFrame) -> dict:
+    """
+    Keep this compact: only include a small set of useful, stable columns if present.
+    """
+    preferred = [
+        "close",
+        "ma_20",
+        "ma_50",
+        "rsi_14",
+        "return_1d",
+        "volatility_20",
+    ]
+    out = {}
+    if df is None or len(df) == 0:
+        return out
+
+    row = df.iloc[-1]
+    for c in preferred:
+        if c in df.columns:
+            v = row.get(c)
+            try:
+                if pd.notna(v):
+                    out[c] = float(v)
+            except Exception:
+                pass
+    return out
+
+def _build_explain(
+    asset: str,
+    mode: str,
+    price_df: pd.DataFrame,
+    latest_signal: int,
+    latest_sentiment: Optional[float],
+) -> "ExplainBlock":
+    features = _extract_latest_features(price_df)
+
+    parts = [
+        f"Asset: {asset}",
+        f"Mode: {mode}",
+        f"Decision: {_signal_to_text(latest_signal)} ({latest_signal})",
+    ]
+
+    if features:
+        shown = []
+        for k in ["close", "ma_20", "rsi_14", "return_1d"]:
+            if k in features:
+                shown.append(f"{k}={features[k]:.4f}")
+        if shown:
+            parts.append("Key indicators: " + ", ".join(shown))
+
+    if mode == "combined":
+        if latest_sentiment is None:
+            parts.append("Sentiment: unavailable")
+        else:
+            parts.append(f"Sentiment (Fear&Greed normalized 0–1): {latest_sentiment:.4f}")
+
+    parts.append("Note: decision is produced by the deployed rule-based engine; this block exposes the inputs used for transparency.")
+
+    facts = {
+        "engine": {
+            "price": "generate_rule_based_signal",
+            "combined": "generate_combined_signal",
+        },
+        "latest_signal": latest_signal,
+        "latest_signal_text": _signal_to_text(latest_signal),
+        "latest_sentiment": latest_sentiment,
+        "price_features_used": features,
+    }
+
+    return ExplainBlock(summary=" | ".join(parts), facts=facts)
+
 def _load_price_pipeline(asset: str):
     """
     Load price data using the correct loader signature.
@@ -143,6 +227,10 @@ def _load_aligned_sentiment(asset: str, price_df):
 # -------------------------
 # Schemas
 # -------------------------
+class ExplainBlock(BaseModel):
+    summary: str
+    facts: dict = Field(default_factory=dict)
+
 class SignalResponse(BaseModel):
     asset: str
     mode: str
@@ -151,6 +239,7 @@ class SignalResponse(BaseModel):
     latest_signal_text: Literal["BUY", "HOLD", "SELL"]
     latest_sentiment: Optional[float] = None
     cached_at_utc: Optional[str] = None
+    explain: Optional[ExplainBlock] = None
 
 # -------------------------
 # Routes
@@ -160,7 +249,11 @@ def health():
     return {"status": "ok"}
 
 @app.get("/signal", response_model=SignalResponse)
-def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined"):
+def get_signal(
+    asset: str = "BTC-USD",
+    mode: Literal["price_only", "combined"] = "combined",
+    explain: int = 0,
+):
     t0 = time.time()
     _emit_metric("SignalRequest", 1, asset=asset, mode=mode)
 
@@ -176,7 +269,14 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
 
     if cached and _is_fresh(cached.get("cached_at", ""), ttl):
         _emit_metric("CacheHit", 1, asset=asset, mode=mode)
-        _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+        _emit_metric(
+            "SignalLatencyMs",
+            (time.time() - t0) * 1000,
+            unit="Milliseconds",
+            asset=asset,
+            mode=mode,
+        )
+
         return SignalResponse(
             asset=asset,
             mode=mode,
@@ -185,6 +285,7 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
             latest_signal_text=_signal_to_text(int(cached["latest_signal"])),
             latest_sentiment=cached.get("latest_sentiment"),
             cached_at_utc=cached.get("cached_at"),
+            explain=cached.get("explain") if explain == 1 else None,
         )
 
     _emit_metric("CacheMiss", 1, asset=asset, mode=mode)
@@ -214,7 +315,11 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
         latest_signal_text=_signal_to_text(latest_signal),
         latest_sentiment=latest_sentiment,
         cached_at_utc=cached_at,
+        explain=None,
     )
+
+    if explain == 1:
+        resp.explain = _build_explain(asset, mode, price_sig, latest_signal, latest_sentiment)
 
     # Cache write (best effort)
     if bucket:
@@ -225,6 +330,7 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
             "latest_signal": resp.latest_signal,
             "latest_sentiment": resp.latest_sentiment,
             "cached_at": cached_at,  # IMPORTANT: reader expects cached_at
+            "explain": _dump(resp.explain) if resp.explain else None,
         }
         try:
             write_latest_signal(asset, mode, payload)
@@ -232,8 +338,22 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
         except Exception:
             _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
 
-    _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+    _emit_metric(
+        "SignalLatencyMs",
+        (time.time() - t0) * 1000,
+        unit="Milliseconds",
+        asset=asset,
+        mode=mode,
+    )
     return resp
+
+@app.get("/signal/explain", response_model=SignalResponse)
+def get_signal_explain(
+    asset: str = "BTC-USD",
+    mode: Literal["price_only", "combined"] = "combined",
+):
+    # Protected by middleware (same as /signal). Just force explain=1.
+    return get_signal(asset=asset, mode=mode, explain=1)
 
 @app.get("/debug/cache/read")
 def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
