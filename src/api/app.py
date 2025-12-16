@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import json
 import hashlib
 from datetime import datetime, timezone
 from typing import Literal, Optional, Dict, Any, List
@@ -26,7 +27,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.8")
+app = FastAPI(title="Intellpulse API", version="0.2.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,6 +41,8 @@ app.add_middleware(
 # CloudWatch Metrics
 # -------------------------
 _cw = boto3.client("cloudwatch")
+_s3 = boto3.client("s3")
+
 METRICS_NS = os.getenv("METRICS_NAMESPACE", "Intellpulse/MVP1")
 SERVICE_NAME = os.getenv(
     "SERVICE_NAME",
@@ -66,21 +69,83 @@ def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> 
         print(f"METRICS_WARN — {e}")
 
 # -------------------------
-# API Key protection + Usage Tracking
+# API Key protection + Usage Tracking + Soft Quota
 # -------------------------
 PUBLIC_PATHS = {"/health"}
 
 def _key_hash(x_api_key: Optional[str]) -> str:
-    """
-    Privacy-safe identifier for usage tracking.
-    Never emit/store raw API keys.
-    """
     if not x_api_key:
         return "unknown"
     return hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()[:12]
 
 def _endpoint_name(path: str) -> str:
     return path or "unknown"
+
+def _daily_quota() -> int:
+    """
+    DAILY_QUOTA:
+      - unset / <=0 => disabled
+      - >0 => enforced per key_hash per UTC day
+    """
+    try:
+        return int(os.getenv("DAILY_QUOTA", "0"))
+    except Exception:
+        return 0
+
+def _utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _quota_key(day: str, key_hash: str) -> str:
+    # Keep this separate from signals/ so it's clean.
+    return f"quota/daily/{day}/{key_hash}.json"
+
+def _s3_read_json(bucket: str, key: str) -> Optional[dict]:
+    try:
+        obj = _s3.get_object(Bucket=bucket, Key=key)
+        raw = obj["Body"].read()
+        return json.loads(raw.decode("utf-8"))
+    except _s3.exceptions.NoSuchKey:  # type: ignore
+        return None
+    except Exception:
+        return None
+
+def _s3_write_json(bucket: str, key: str, payload: dict) -> None:
+    _s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+def _enforce_quota(endpoint: str, key_hash: str) -> Optional[JSONResponse]:
+    """
+    Returns a 429 JSONResponse if quota exceeded, else None.
+    Fail-open if bucket isn't available or S3 errors occur.
+    """
+    q = _daily_quota()
+    if q <= 0:
+        return None
+
+    try:
+        bucket = cache_bucket()
+    except Exception:
+        return None  # fail-open
+
+    day = _utc_day()
+    k = _quota_key(day, key_hash)
+
+    current = _s3_read_json(bucket, k) or {}
+    count = int(current.get("count", 0))
+
+    if count >= q:
+        _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=key_hash)
+        return JSONResponse({"detail": "Daily quota exceeded"}, status_code=429)
+
+    # increment (best-effort; race conditions acceptable for MVP)
+    count += 1
+    _s3_write_json(bucket, k, {"day": day, "key_hash": key_hash, "count": count, "updated_at": datetime.now(timezone.utc).isoformat()})
+
+    return None
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
@@ -103,9 +168,14 @@ async def api_key_middleware(request: Request, call_next):
         _emit_metric("EndpointRequest", 1, endpoint=endpoint)
         return JSONResponse({"detail": "Invalid API key"}, status_code=401)
 
-    # Authorized
+    # Authorized usage tracking
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
+
+    # Soft quota (enforced per key_hash per UTC day)
+    quota_resp = _enforce_quota(endpoint=endpoint, key_hash=request.state.key_hash)
+    if quota_resp is not None:
+        return quota_resp
 
     return await call_next(request)
 
@@ -130,10 +200,6 @@ def _is_fresh(iso: str, ttl: int) -> bool:
     return age is not None and age <= ttl
 
 def _dump(model_obj) -> dict:
-    """
-    Pydantic v2: model_dump()
-    Pydantic v1: dict()
-    """
     if model_obj is None:
         return {}
     if hasattr(model_obj, "model_dump"):
@@ -204,10 +270,6 @@ def _build_explain(
     return ExplainBlock(summary=" | ".join(parts), facts=facts)
 
 def _load_price_pipeline(asset: str):
-    """
-    Load price data using the correct loader signature.
-    If missing, return 404 (never 500).
-    """
     symbol_filter = asset.replace("-", "_")  # BTC-USD -> BTC_USD
     try:
         price = load_price_data(symbol_filter=symbol_filter)
@@ -233,7 +295,7 @@ def _get_fear_greed_score() -> float:
         v = float(r.json()["data"][0]["value"])
         return max(0.0, min(1.0, v / 100.0))
     except Exception:
-        return 0.5  # stable fallback
+        return 0.5
 
 def _load_aligned_sentiment(asset: str, price_df):
     return pd.DataFrame(index=price_df.index, data={"sentiment_score": _get_fear_greed_score()})
@@ -328,7 +390,6 @@ def _run_backtest(
 
     work["strategy_ret"] = (pos.astype(float) * work["ret_simple"]) - work["cost"]
     work["equity"] = (1.0 + work["strategy_ret"]).cumprod()
-
     work["buy_hold_equity"] = (1.0 + work["ret_simple"]).cumprod()
 
     strat = work["strategy_ret"].dropna()
@@ -395,7 +456,7 @@ class SignalResponse(BaseModel):
     latest_signal: int
     latest_signal_text: Literal["BUY", "HOLD", "SELL"]
     latest_sentiment: Optional[float] = None
-    cached_at_utc: Optional[str] = None
+    cached_at_utc: Optional[float] = None
     explain: Optional[ExplainBlock] = None
 
 # -------------------------
