@@ -11,6 +11,11 @@ env:
     PROD_FN: "intellpulse-api"
     API_KEY: "REPLACE_ME_API_KEY"
 
+    # Quota defaults
+    QUOTA_ENABLED: "1"
+    QUOTA_TABLE: "intellpulse-rate-limit"
+    QUOTA_DAILY_LIMIT: "2000"
+
 phases:
   pre_build:
     commands:
@@ -41,6 +46,25 @@ phases:
       - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\" || (aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" && aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\")"
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
+      # --- SAFE MERGE: preserve existing STG env vars + add quotas ---
+      - "echo \"Fetching STAGING env vars...\""
+      - "STG_ENV_JSON=$(aws lambda get-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --query 'Environment.Variables' --output json)"
+      - "echo \"STG env vars fetched.\""
+
+      - "echo \"Writing merged env vars with QUOTA_* enabled...\""
+      - |
+        python - <<'PY'
+        import json, os
+        env = json.loads(os.environ["STG_ENV_JSON"])
+        env["QUOTA_ENABLED"] = os.environ.get("QUOTA_ENABLED", "1")
+        env["QUOTA_TABLE"] = os.environ.get("QUOTA_TABLE", "intellpulse-rate-limit")
+        env["QUOTA_DAILY_LIMIT"] = os.environ.get("QUOTA_DAILY_LIMIT", "2000")
+        print(json.dumps(env))
+        PY
+        > merged_env.json
+      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment \"Variables=$(cat merged_env.json)\""
+      - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
+
       - "echo \"Staging smoke test: /signal (authenticated)\""
       - "RESP=$(curl -fsS -H \"x-api-key: $API_KEY\" \"${STG_URL%/}/signal?asset=BTC-USD&mode=combined\")"
       - "echo \"$RESP\" | grep -q '\"latest_signal_text\"'"
@@ -51,6 +75,50 @@ phases:
       - "RESP2=$(curl -fsS -H \"x-api-key: $API_KEY\" \"${STG_URL%/}/debug/cache/read?asset=BTC-USD&mode=combined\")"
       - "echo \"$RESP2\" | grep -q '\"enabled\"'"
       - "echo \"Staging /debug/cache/read OK\""
+
+      # --- Quota behavior test (staging only): set limit=5 temporarily, then restore ---
+      - "echo \"Staging quota test: set QUOTA_DAILY_LIMIT=5 temporarily\""
+      - |
+        python - <<'PY'
+        import json, os
+        env = json.loads(os.environ["STG_ENV_JSON"])
+        env["QUOTA_ENABLED"] = "1"
+        env["QUOTA_TABLE"] = os.environ.get("QUOTA_TABLE", "intellpulse-rate-limit")
+        env["QUOTA_DAILY_LIMIT"] = "5"
+        print(json.dumps(env))
+        PY
+        > quota_test_env.json
+      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment \"Variables=$(cat quota_test_env.json)\""
+      - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
+
+      - "echo \"Calling /signal 7 times; expect first 5 = 200, then 429\""
+      - |
+        ok200=0
+        ok429=0
+        for i in 1 2 3 4 5 6 7; do
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "x-api-key: $API_KEY" "${STG_URL%/}/signal?asset=BTC-USD&mode=combined")
+          echo "attempt=$i status=$code"
+          if [ "$code" = "200" ]; then ok200=$((ok200+1)); fi
+          if [ "$code" = "429" ]; then ok429=$((ok429+1)); fi
+        done
+        echo "200_count=$ok200 429_count=$ok429"
+        if [ "$ok200" -lt 1 ]; then echo "Quota test failed: no 200s"; exit 1; fi
+        if [ "$ok429" -lt 1 ]; then echo "Quota test failed: expected at least one 429"; exit 1; fi
+        echo "Staging quota behavior OK"
+
+      - "echo \"Restoring staging quota limit back to $QUOTA_DAILY_LIMIT\""
+      - |
+        python - <<'PY'
+        import json, os
+        env = json.loads(os.environ["STG_ENV_JSON"])
+        env["QUOTA_ENABLED"] = os.environ.get("QUOTA_ENABLED", "1")
+        env["QUOTA_TABLE"] = os.environ.get("QUOTA_TABLE", "intellpulse-rate-limit")
+        env["QUOTA_DAILY_LIMIT"] = os.environ.get("QUOTA_DAILY_LIMIT", "2000")
+        print(json.dumps(env))
+        PY
+        > quota_restore_env.json
+      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment \"Variables=$(cat quota_restore_env.json)\""
+      - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
       - "echo \"Deploying to PROD: $PROD_FN\""
       - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"

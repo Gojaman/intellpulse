@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
 
 import boto3
@@ -134,6 +134,64 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
         return True
 
 
+# -------------------------
+# Usage quotas (DynamoDB) — daily counter per API key
+# -------------------------
+QUOTA_ENABLED = os.getenv("QUOTA_ENABLED", "0") == "1"
+QUOTA_TABLE = os.getenv("QUOTA_TABLE", RATE_TABLE)  # default reuse rate table
+QUOTA_DAILY_LIMIT = int(os.getenv("QUOTA_DAILY_LIMIT", "2000"))
+
+# Endpoints that count against daily quota
+BILLABLE_PATHS = {"/signal", "/signal/explain", "/backtest"}
+
+def _utc_yyyymmdd() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
+    now = datetime.now(timezone.utc)
+    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+    return int((tomorrow_midnight + timedelta(minutes=extra_minutes)).timestamp())
+
+def _quota_pk(key_hash: str) -> str:
+    return f"quota#{key_hash}#{_utc_yyyymmdd()}"
+
+def _quota_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
+    """
+    Atomically increments today's counter if under limit.
+    Fail-open on DDB errors (MVP-safe).
+    """
+    if not QUOTA_ENABLED:
+        return True
+
+    pk = _quota_pk(key_hash)
+    expires_at = _next_midnight_utc_epoch(extra_minutes=10)
+
+    try:
+        # Only increment if current n < limit
+        _ddb.update_item(
+            TableName=QUOTA_TABLE,
+            Key={"pk": {"S": pk}},
+            UpdateExpression="SET #n = if_not_exists(#n, :z) + :c, expires_at = :exp",
+            ConditionExpression="attribute_not_exists(#n) OR #n < :limit",
+            ExpressionAttributeNames={"#n": "n"},
+            ExpressionAttributeValues={
+                ":z": {"N": "0"},
+                ":c": {"N": str(int(cost))},
+                ":limit": {"N": str(int(QUOTA_DAILY_LIMIT))},
+                ":exp": {"N": str(int(expires_at))},
+            },
+        )
+        return True
+
+    except _ddb.exceptions.ConditionalCheckFailedException:
+        # limit hit
+        return False
+
+    except Exception as e:
+        print(f"QUOTA_DDB_WARN — {e}")
+        _emit_metric("QuotaError", 1, endpoint=endpoint, key_hash=key_hash)
+        return True
+
 
 # -------------------------
 # API Key protection
@@ -203,6 +261,13 @@ async def api_key_middleware(request: Request, call_next):
     request.state.key_hash = _sha256_12(provided)
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
+
+    # Usage quota (daily) — do this early for billable endpoints
+    if endpoint in BILLABLE_PATHS:
+        ok = _quota_allow_request(request.state.key_hash, endpoint, cost=1)
+        if not ok:
+            _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+            return JSONResponse({"detail": "Quota exceeded"}, status_code=429)
 
     # Global limiter (DDB)
     if not _global_allow_request(request.state.key_hash, endpoint, cost=1.0):
