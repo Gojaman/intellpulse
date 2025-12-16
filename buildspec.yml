@@ -28,6 +28,8 @@ phases:
   post_build:
     commands:
       - "set -eu"
+      - "setopt NO_NOMATCH 2>/dev/null || true"
+
       - "echo \"Pushing image to ECR...\""
       - "docker push \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG\""
       - "DIGEST=$(aws ecr describe-images --region \"$AWS_REGION\" --repository-name \"$REPO_NAME\" --image-ids imageTag=\"$IMAGE_TAG\" --query \"imageDetails[0].imageDigest\" --output text)"
@@ -37,7 +39,7 @@ phases:
       - "STG_PREV_URI=$(aws lambda get-function --function-name \"$STG_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text)"
       - "echo \"STAGING_PREVIOUS_IMAGE_URI=$STG_PREV_URI\""
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
-      - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
+      - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\" || (aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" && aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\")"
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
       - "echo \"Staging smoke test: /signal (authenticated)\""
@@ -51,6 +53,6 @@ phases:
       - "PROD_PREV_URI=$(aws lambda get-function --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text)"
       - "echo \"PROD_PREVIOUS_IMAGE_URI=$PROD_PREV_URI\""
       - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"
-      - "aws lambda update-function-code --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\""
+      - "aws lambda update-function-code --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\" || (aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" && aws lambda update-function-code --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\")"
       - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"
       - "aws lambda get-function --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --query \"Code.ImageUri\" --output text"
