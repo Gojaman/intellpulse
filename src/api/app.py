@@ -4,6 +4,7 @@ import os
 import time
 import json
 import hashlib
+import threading
 from datetime import datetime, timezone
 from typing import Literal, Optional, Dict, Any, List
 
@@ -28,7 +29,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.10")
+app = FastAPI(title="Intellpulse API", version="0.2.12")
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,6 +165,59 @@ def _enforce_quota(endpoint: str, key_hash: str) -> Optional[JSONResponse]:
         _emit_metric("QuotaError", 1, endpoint=endpoint)
         return None
 
+# -------------------------
+# Rate limiting (token bucket, per Lambda container)
+# -------------------------
+_rl_lock = threading.Lock()
+_rl_buckets: Dict[str, Dict[str, float]] = {}  # key_hash -> {tokens, last_ts}
+
+def _rl_rps() -> float:
+    try:
+        return float(os.getenv("RATE_LIMIT_RPS", "3"))
+    except Exception:
+        return 3.0
+
+def _rl_burst() -> float:
+    try:
+        return float(os.getenv("RATE_LIMIT_BURST", "10"))
+    except Exception:
+        return 10.0
+
+def _rate_limit_allow(key_hash: str) -> bool:
+    """
+    Token bucket:
+      - refill at RATE_LIMIT_RPS
+      - capacity RATE_LIMIT_BURST
+    FAIL-OPEN: any error => allow
+    """
+    try:
+        rps = max(0.0, _rl_rps())
+        burst = max(1.0, _rl_burst())
+
+        if rps <= 0:
+            return True  # disabled
+
+        now = time.time()
+
+        with _rl_lock:
+            b = _rl_buckets.get(key_hash)
+            if not b:
+                b = {"tokens": burst, "last_ts": now}
+                _rl_buckets[key_hash] = b
+
+            # refill
+            dt = max(0.0, now - float(b["last_ts"]))
+            b["tokens"] = min(burst, float(b["tokens"]) + dt * rps)
+            b["last_ts"] = now
+
+            if b["tokens"] >= 1.0:
+                b["tokens"] -= 1.0
+                return True
+
+        return False
+    except Exception:
+        return True
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     endpoint = _endpoint_name(request.url.path)
@@ -194,6 +248,11 @@ async def api_key_middleware(request: Request, call_next):
     quota_resp = _enforce_quota(endpoint=endpoint, key_hash=request.state.key_hash)
     if quota_resp is not None:
         return quota_resp
+
+    # Rate limit (per container; MVP-safe)
+    if not _rate_limit_allow(request.state.key_hash):
+        _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
 
     return await call_next(request)
 
@@ -416,7 +475,6 @@ def _run_backtest(
 
     work["strategy_ret"] = (pos.astype(float) * work["ret_simple"]) - work["cost"]
     work["equity"] = (1.0 + work["strategy_ret"]).cumprod()
-
     work["buy_hold_equity"] = (1.0 + work["ret_simple"]).cumprod()
 
     strat = work["strategy_ret"].dropna()
@@ -522,7 +580,6 @@ def get_signal(
         if age is not None:
             _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
         _emit_metric("CacheFresh", 1, unit="Count", asset=asset, mode=mode)
-
         _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
 
         return SignalResponse(
@@ -686,5 +743,36 @@ def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
         "fresh": age is not None and age <= ttl,
         "payload": cached,
     }
+
+@app.get("/debug/usage/today")
+def debug_usage_today(request: Request):
+    """
+    Shows today's usage for the caller's API key (hashed), using the same S3 counter.
+    Protected by middleware.
+    """
+    key_hash = getattr(request.state, "key_hash", "unknown")
+    quota = _daily_quota()
+    day = _utc_day()
+
+    try:
+        bucket = cache_bucket()
+        k = _quota_key(day, key_hash)
+        current = _s3_read_json(bucket, k) or {}
+        count = int(current.get("count", 0))
+        remaining = None if quota <= 0 else max(0, quota - count)
+
+        return {
+            "enabled": True,
+            "day_utc": day,
+            "key_hash": key_hash,
+            "daily_quota": quota if quota > 0 else None,
+            "count": count,
+            "remaining": remaining,
+            "bucket": bucket,
+            "key": k,
+            "updated_at": current.get("updated_at"),
+        }
+    except Exception as e:
+        return {"enabled": False, "reason": str(e), "day_utc": day, "key_hash": key_hash}
 
 handler = Mangum(app)
