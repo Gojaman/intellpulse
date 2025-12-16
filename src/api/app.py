@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import hashlib
 from datetime import datetime, timezone
 from typing import Literal, Optional, Dict, Any, List
 
@@ -25,7 +26,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.7")
+app = FastAPI(title="Intellpulse API", version="0.2.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,21 +66,46 @@ def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> 
         print(f"METRICS_WARN — {e}")
 
 # -------------------------
-# API Key protection
+# API Key protection + Usage Tracking
 # -------------------------
 PUBLIC_PATHS = {"/health"}
 
+def _key_hash(x_api_key: Optional[str]) -> str:
+    """
+    Privacy-safe identifier for usage tracking.
+    Never emit/store raw API keys.
+    """
+    if not x_api_key:
+        return "unknown"
+    return hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()[:12]
+
+def _endpoint_name(path: str) -> str:
+    return path or "unknown"
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
+    endpoint = _endpoint_name(request.url.path)
+
     if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
 
+    provided = request.headers.get("x-api-key")
+    request.state.key_hash = _key_hash(provided)
+
     api_key = os.getenv("API_KEY")
     if not api_key:
+        # no auth configured → still track endpoint usage (no key)
+        _emit_metric("EndpointRequest", 1, endpoint=endpoint)
         return await call_next(request)
 
-    if request.headers.get("x-api-key") != api_key:
+    if provided != api_key:
+        _emit_metric("ApiKeyUnauthorized", 1, endpoint=endpoint, key_hash="unknown")
+        _emit_metric("EndpointRequest", 1, endpoint=endpoint)
         return JSONResponse({"detail": "Invalid API key"}, status_code=401)
+
+    # Authorized
+    _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+    _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
     return await call_next(request)
 
@@ -160,7 +186,9 @@ def _build_explain(
         else:
             parts.append(f"Sentiment (Fear&Greed normalized 0–1): {latest_sentiment:.4f}")
 
-    parts.append("Note: decision is produced by the deployed rule-based engine; this block exposes the inputs used for transparency.")
+    parts.append(
+        "Note: decision is produced by the deployed rule-based engine; this block exposes the inputs used for transparency."
+    )
 
     facts = {
         "engine": {
@@ -208,10 +236,7 @@ def _get_fear_greed_score() -> float:
         return 0.5  # stable fallback
 
 def _load_aligned_sentiment(asset: str, price_df):
-    return pd.DataFrame(
-        index=price_df.index,
-        data={"sentiment_score": _get_fear_greed_score()},
-    )
+    return pd.DataFrame(index=price_df.index, data={"sentiment_score": _get_fear_greed_score()})
 
 # -------------------------
 # Backtest helpers
@@ -224,10 +249,6 @@ def _max_drawdown(equity: pd.Series) -> float:
     return float(dd.min())
 
 def _infer_bar_interval(index: pd.DatetimeIndex) -> str:
-    """
-    Infer a simple interval label from median index delta.
-    Returns '1h', '1d', or 'unknown'.
-    """
     if index is None or len(index) < 3:
         return "unknown"
     deltas = index.to_series().diff().dropna()
@@ -235,7 +256,6 @@ def _infer_bar_interval(index: pd.DatetimeIndex) -> str:
         return "unknown"
     med = deltas.median()
     sec = float(med.total_seconds())
-    # Tolerances: +/- 10%
     if 3600 * 0.9 <= sec <= 3600 * 1.1:
         return "1h"
     if 86400 * 0.9 <= sec <= 86400 * 1.1:
@@ -244,16 +264,12 @@ def _infer_bar_interval(index: pd.DatetimeIndex) -> str:
 
 def _default_annualization(bar_interval: str) -> int:
     if bar_interval == "1h":
-        return 365 * 24  # crypto hourly
+        return 365 * 24
     if bar_interval == "1d":
-        return 365       # crypto daily
-    return 252          # fallback
+        return 365
+    return 252
 
 def _trade_stats(position: pd.Series, strat_ret: pd.Series) -> Dict[str, Any]:
-    """
-    Very lightweight trade stats.
-    We consider a "trade" whenever position goes from 0 -> nonzero and ends when it returns to 0.
-    """
     pos = position.fillna(0).astype(int)
     r = strat_ret.fillna(0.0)
 
@@ -283,10 +299,7 @@ def _trade_stats(position: pd.Series, strat_ret: pd.Series) -> Dict[str, Any]:
         return {"trades": 0, "win_rate": 0.0}
 
     wins = sum(1 for x in trade_pnls if x > 0)
-    return {
-        "trades": int(len(trade_pnls)),
-        "win_rate": float(wins / len(trade_pnls)),
-    }
+    return {"trades": int(len(trade_pnls)), "win_rate": float(wins / len(trade_pnls))}
 
 def _run_backtest(
     df: pd.DataFrame,
@@ -295,42 +308,27 @@ def _run_backtest(
     slippage_bps: float,
     annualization: int,
 ) -> Dict[str, Any]:
-    """
-    Backtest using next-bar execution (lookahead-safe):
-      position[t] = signal[t-1]
-    Uses log returns column: 'return' from your feature pipeline.
-    Costs are applied on position changes:
-      cost = abs(delta_position) * (fee+slippage) / 10000
-      (flip counts as 2x, e.g., +1 -> -1 is abs(-2)=2)
-    Also computes buy&hold baseline.
-    """
     if "return" not in df.columns:
         raise ValueError("DataFrame must contain 'return' (log returns) column")
     if signal_col not in df.columns:
         raise ValueError(f"DataFrame must contain '{signal_col}' column")
 
     work = df.copy()
-
-    # log -> simple returns
     work["ret_simple"] = np.expm1(work["return"].astype(float))
 
-    # positions (lookahead-safe)
     sig = work[signal_col].fillna(0).astype(int)
     pos = sig.shift(1).fillna(0).astype(int)
     work["position"] = pos
 
-    # transaction costs on position changes
     total_cost_bps = float(fee_bps) + float(slippage_bps)
     cost_rate = total_cost_bps / 10000.0
 
     dpos = pos.diff().fillna(pos).abs()
     work["cost"] = dpos.astype(float) * cost_rate
 
-    # strategy returns
     work["strategy_ret"] = (pos.astype(float) * work["ret_simple"]) - work["cost"]
     work["equity"] = (1.0 + work["strategy_ret"]).cumprod()
 
-    # buy & hold baseline (no costs)
     work["buy_hold_equity"] = (1.0 + work["ret_simple"]).cumprod()
 
     strat = work["strategy_ret"].dropna()
@@ -418,7 +416,6 @@ def get_signal(
 
     ttl = _cache_ttl_seconds()
 
-    # Cache read (best effort)
     try:
         bucket = cache_bucket()
         cached = read_latest_signal(asset, mode)
@@ -430,7 +427,6 @@ def get_signal(
     age = _age_seconds(cached_at_val) if cached else None
     fresh = _is_fresh(cached_at_val, ttl) if cached else False
 
-    # bypass cache when explain=1
     if cached and fresh and explain != 1:
         _emit_metric("CacheHit", 1, asset=asset, mode=mode)
         if age is not None:
@@ -524,11 +520,6 @@ def backtest(
     period: Optional[Literal["1h", "1d"]] = None,
     annualization: Optional[int] = None,
 ):
-    """
-    Backtest endpoint.
-    - period: optional override ('1h' or '1d'). If omitted, inferred from index deltas.
-    - annualization: optional override. If omitted, derived from period/inference.
-    """
     t0 = time.time()
     _emit_metric("BacktestRequest", 1, asset=asset, mode=mode)
 
