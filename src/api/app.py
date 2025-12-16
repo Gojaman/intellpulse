@@ -24,7 +24,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.4")
+app = FastAPI(title="Intellpulse API", version="0.2.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -216,6 +216,7 @@ def _get_fear_greed_score() -> float:
         v = float(r.json()["data"][0]["value"])
         return max(0.0, min(1.0, v / 100.0))
     except Exception:
+        # keep API stable if sentiment fails
         return 0.5
 
 def _load_aligned_sentiment(asset: str, price_df):
@@ -302,62 +303,75 @@ def get_signal(
     if cached and age is not None:
         _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
 
-    # Compute (and handle missing price data cleanly)
-    price_sig = _load_price_pipeline(asset)
-    if isinstance(price_sig, JSONResponse):
-        return price_sig  # 404 response
+    # Compute section (hardened)
+    try:
+        # Compute (and handle missing price data cleanly)
+        price_sig = _load_price_pipeline(asset)
+        if isinstance(price_sig, JSONResponse):
+            return price_sig  # 404 response
 
-    latest_ts = price_sig.index[-1]
-    latest_signal = int(price_sig["signal"].iloc[-1])
-    latest_sentiment: Optional[float] = None
+        latest_ts = price_sig.index[-1]
+        latest_signal = int(price_sig["signal"].iloc[-1])
+        latest_sentiment: Optional[float] = None
 
-    if mode == "combined":
-        sent = _load_aligned_sentiment(asset, price_sig)
-        combined = generate_combined_signal(price_sig, sent)
-        latest_signal = int(combined["signal_combined"].iloc[-1])
-        latest_sentiment = float(combined["sentiment_score"].iloc[-1])
+        if mode == "combined":
+            # sentiment failures already default to 0.5 inside _get_fear_greed_score
+            sent = _load_aligned_sentiment(asset, price_sig)
+            combined = generate_combined_signal(price_sig, sent)
+            latest_signal = int(combined["signal_combined"].iloc[-1])
+            latest_sentiment = float(combined["sentiment_score"].iloc[-1])
 
-    cached_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        cached_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    resp = SignalResponse(
-        asset=asset,
-        mode=mode,
-        latest_timestamp=latest_ts.isoformat(),
-        latest_signal=latest_signal,
-        latest_signal_text=_signal_to_text(latest_signal),
-        latest_sentiment=latest_sentiment,
-        cached_at_utc=cached_at,
-        explain=None,
-    )
+        resp = SignalResponse(
+            asset=asset,
+            mode=mode,
+            latest_timestamp=latest_ts.isoformat(),
+            latest_signal=latest_signal,
+            latest_signal_text=_signal_to_text(latest_signal),
+            latest_sentiment=latest_sentiment,
+            cached_at_utc=cached_at,
+            explain=None,
+        )
 
-    if explain == 1:
-        resp.explain = _build_explain(asset, mode, price_sig, latest_signal, latest_sentiment)
+        if explain == 1:
+            resp.explain = _build_explain(asset, mode, price_sig, latest_signal, latest_sentiment)
 
-    # Cache write (best effort)
-    if bucket:
-        payload = {
-            "asset": resp.asset,
-            "mode": resp.mode,
-            "latest_timestamp": resp.latest_timestamp,
-            "latest_signal": resp.latest_signal,
-            "latest_sentiment": resp.latest_sentiment,
-            "cached_at": cached_at,  # IMPORTANT: reader expects cached_at
-            "explain": _dump(resp.explain) if resp.explain else None,
-        }
-        try:
-            write_latest_signal(asset, mode, payload)
-            _emit_metric("CacheWrite", 1, asset=asset, mode=mode)
-        except Exception:
-            _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
+        # Cache write (best effort)
+        if bucket:
+            payload = {
+                "asset": resp.asset,
+                "mode": resp.mode,
+                "latest_timestamp": resp.latest_timestamp,
+                "latest_signal": resp.latest_signal,
+                "latest_sentiment": resp.latest_sentiment,
+                "cached_at": cached_at,  # IMPORTANT: reader expects cached_at
+                "explain": _dump(resp.explain) if resp.explain else None,
+            }
+            try:
+                write_latest_signal(asset, mode, payload)
+                _emit_metric("CacheWrite", 1, asset=asset, mode=mode)
+            except Exception:
+                _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
 
-    _emit_metric(
-        "SignalLatencyMs",
-        (time.time() - t0) * 1000,
-        unit="Milliseconds",
-        asset=asset,
-        mode=mode,
-    )
-    return resp
+        _emit_metric(
+            "SignalLatencyMs",
+            (time.time() - t0) * 1000,
+            unit="Milliseconds",
+            asset=asset,
+            mode=mode,
+        )
+        return resp
+
+    except Exception as e:
+        # Never 500: return a clean, demo-safe 503 and emit SignalError
+        reason = type(e).__name__
+        _emit_metric("SignalError", 1, asset=asset, mode=mode, reason=reason)
+        print(f"SIGNAL_ERROR — asset={asset} mode={mode} reason={reason} err={e}")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"Data unavailable for asset {asset}"},
+        )
 
 @app.get("/signal/explain", response_model=SignalResponse)
 def get_signal_explain(
