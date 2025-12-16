@@ -25,7 +25,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.6")
+app = FastAPI(title="Intellpulse API", version="0.2.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,20 +117,10 @@ def _dump(model_obj) -> dict:
     return dict(model_obj)
 
 def _extract_latest_features(df: pd.DataFrame) -> dict:
-    preferred = [
-        "close",
-        "ma_20",
-        "ma_50",
-        "rsi_14",
-        "return_1d",
-        "volatility_20",
-        "return",
-        "vol_20",
-    ]
+    preferred = ["close", "ma_20", "ma_50", "rsi_14", "return", "vol_20"]
     out = {}
     if df is None or len(df) == 0:
         return out
-
     row = df.iloc[-1]
     for c in preferred:
         if c in df.columns:
@@ -157,13 +147,12 @@ def _build_explain(
         f"Decision: {_signal_to_text(latest_signal)} ({latest_signal})",
     ]
 
-    if features:
-        shown = []
-        for k in ["close", "ma_20", "rsi_14"]:
-            if k in features:
-                shown.append(f"{k}={features[k]:.4f}")
-        if shown:
-            parts.append("Key indicators: " + ", ".join(shown))
+    shown = []
+    for k in ["close", "ma_20", "rsi_14"]:
+        if k in features:
+            shown.append(f"{k}={features[k]:.4f}")
+    if shown:
+        parts.append("Key indicators: " + ", ".join(shown))
 
     if mode == "combined":
         if latest_sentiment is None:
@@ -234,6 +223,32 @@ def _max_drawdown(equity: pd.Series) -> float:
     dd = (equity / peak) - 1.0
     return float(dd.min())
 
+def _infer_bar_interval(index: pd.DatetimeIndex) -> str:
+    """
+    Infer a simple interval label from median index delta.
+    Returns '1h', '1d', or 'unknown'.
+    """
+    if index is None or len(index) < 3:
+        return "unknown"
+    deltas = index.to_series().diff().dropna()
+    if deltas.empty:
+        return "unknown"
+    med = deltas.median()
+    sec = float(med.total_seconds())
+    # Tolerances: +/- 10%
+    if 3600 * 0.9 <= sec <= 3600 * 1.1:
+        return "1h"
+    if 86400 * 0.9 <= sec <= 86400 * 1.1:
+        return "1d"
+    return "unknown"
+
+def _default_annualization(bar_interval: str) -> int:
+    if bar_interval == "1h":
+        return 365 * 24  # crypto hourly
+    if bar_interval == "1d":
+        return 365       # crypto daily
+    return 252          # fallback
+
 def _trade_stats(position: pd.Series, strat_ret: pd.Series) -> Dict[str, Any]:
     """
     Very lightweight trade stats.
@@ -251,7 +266,6 @@ def _trade_stats(position: pd.Series, strat_ret: pd.Series) -> Dict[str, Any]:
         ri = float(r.iloc[i])
 
         if not in_trade and p != 0:
-            # enter trade
             in_trade = True
             cur = 1.0
 
@@ -259,11 +273,9 @@ def _trade_stats(position: pd.Series, strat_ret: pd.Series) -> Dict[str, Any]:
             cur *= (1.0 + ri)
 
         if in_trade and p == 0:
-            # exit trade
             in_trade = False
             trade_pnls.append(cur - 1.0)
 
-    # if still in trade at end, close it
     if in_trade:
         trade_pnls.append(cur - 1.0)
 
@@ -287,13 +299,13 @@ def _run_backtest(
     Backtest using next-bar execution (lookahead-safe):
       position[t] = signal[t-1]
     Uses log returns column: 'return' from your feature pipeline.
-    Converts to simple returns for equity compounding.
     Costs are applied on position changes:
       cost = abs(delta_position) * (fee+slippage) / 10000
+      (flip counts as 2x, e.g., +1 -> -1 is abs(-2)=2)
+    Also computes buy&hold baseline.
     """
     if "return" not in df.columns:
         raise ValueError("DataFrame must contain 'return' (log returns) column")
-
     if signal_col not in df.columns:
         raise ValueError(f"DataFrame must contain '{signal_col}' column")
 
@@ -311,17 +323,19 @@ def _run_backtest(
     total_cost_bps = float(fee_bps) + float(slippage_bps)
     cost_rate = total_cost_bps / 10000.0
 
-    dpos = pos.diff().fillna(pos).abs()  # first bar: entering counts as abs(pos)
+    dpos = pos.diff().fillna(pos).abs()
     work["cost"] = dpos.astype(float) * cost_rate
 
     # strategy returns
     work["strategy_ret"] = (pos.astype(float) * work["ret_simple"]) - work["cost"]
-
-    # equity curve
     work["equity"] = (1.0 + work["strategy_ret"]).cumprod()
+
+    # buy & hold baseline (no costs)
+    work["buy_hold_equity"] = (1.0 + work["ret_simple"]).cumprod()
 
     strat = work["strategy_ret"].dropna()
     eq = work["equity"].dropna()
+    bh_eq = work["buy_hold_equity"].dropna()
 
     if len(strat) < 5 or len(eq) < 5:
         return {
@@ -338,8 +352,11 @@ def _run_backtest(
     mdd = _max_drawdown(eq)
     trade_stats = _trade_stats(work["position"], work["strategy_ret"])
 
-    # sample equity points for UI (last 50)
-    tail = work[["equity"]].tail(50).copy()
+    buy_hold_total_return = float(bh_eq.iloc[-1] - 1.0) if len(bh_eq) else 0.0
+    buy_hold_max_drawdown = _max_drawdown(bh_eq) if len(bh_eq) else 0.0
+    buy_hold_equity_end = float(bh_eq.iloc[-1]) if len(bh_eq) else 1.0
+
+    tail = work[["equity"]].tail(50)
     equity_points = [
         {"t": idx.isoformat(), "equity": float(val)}
         for idx, val in zip(tail.index, tail["equity"].values)
@@ -359,6 +376,9 @@ def _run_backtest(
         "win_rate": trade_stats["win_rate"],
         "equity_end": float(eq.iloc[-1]),
         "equity_points": equity_points,
+        "buy_hold_total_return": buy_hold_total_return,
+        "buy_hold_max_drawdown": buy_hold_max_drawdown,
+        "buy_hold_equity_end": buy_hold_equity_end,
         "period_start": work.index.min().isoformat() if len(work) else None,
         "period_end": work.index.max().isoformat() if len(work) else None,
     }
@@ -406,25 +426,18 @@ def get_signal(
         bucket = None
         cached = None
 
-    # Cache age/freshness instrumentation (best effort)
     cached_at_val = cached.get("cached_at", "") if cached else ""
     age = _age_seconds(cached_at_val) if cached else None
     fresh = _is_fresh(cached_at_val, ttl) if cached else False
 
-    # NOTE: bypass cache when explain=1
+    # bypass cache when explain=1
     if cached and fresh and explain != 1:
         _emit_metric("CacheHit", 1, asset=asset, mode=mode)
         if age is not None:
             _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
         _emit_metric("CacheFresh", 1, unit="Count", asset=asset, mode=mode)
 
-        _emit_metric(
-            "SignalLatencyMs",
-            (time.time() - t0) * 1000,
-            unit="Milliseconds",
-            asset=asset,
-            mode=mode,
-        )
+        _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
 
         return SignalResponse(
             asset=asset,
@@ -442,11 +455,10 @@ def get_signal(
     if cached and age is not None:
         _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
 
-    # Compute section (hardened)
     try:
         price_sig = _load_price_pipeline(asset)
         if isinstance(price_sig, JSONResponse):
-            return price_sig  # 404 response
+            return price_sig
 
         latest_ts = price_sig.index[-1]
         latest_signal = int(price_sig["signal"].iloc[-1])
@@ -474,7 +486,6 @@ def get_signal(
         if explain == 1:
             resp.explain = _build_explain(asset, mode, price_sig, latest_signal, latest_sentiment)
 
-        # Cache write (best effort)
         if bucket:
             payload = {
                 "asset": resp.asset,
@@ -482,7 +493,7 @@ def get_signal(
                 "latest_timestamp": resp.latest_timestamp,
                 "latest_signal": resp.latest_signal,
                 "latest_sentiment": resp.latest_sentiment,
-                "cached_at": cached_at,  # IMPORTANT: reader expects cached_at
+                "cached_at": cached_at,
                 "explain": _dump(resp.explain) if resp.explain else None,
             }
             try:
@@ -491,29 +502,17 @@ def get_signal(
             except Exception:
                 _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
 
-        _emit_metric(
-            "SignalLatencyMs",
-            (time.time() - t0) * 1000,
-            unit="Milliseconds",
-            asset=asset,
-            mode=mode,
-        )
+        _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
         return resp
 
     except Exception as e:
         reason = type(e).__name__
         _emit_metric("SignalError", 1, asset=asset, mode=mode, reason=reason)
         print(f"SIGNAL_ERROR — asset={asset} mode={mode} reason={reason} err={e}")
-        return JSONResponse(
-            status_code=503,
-            content={"detail": f"Data unavailable for asset {asset}"},
-        )
+        return JSONResponse(status_code=503, content={"detail": f"Data unavailable for asset {asset}"})
 
 @app.get("/signal/explain", response_model=SignalResponse)
-def get_signal_explain(
-    asset: str = "BTC-USD",
-    mode: Literal["price_only", "combined"] = "combined",
-):
+def get_signal_explain(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined"):
     return get_signal(asset=asset, mode=mode, explain=1)
 
 @app.get("/backtest")
@@ -522,12 +521,13 @@ def backtest(
     mode: Literal["price_only", "combined"] = "combined",
     fee_bps: float = 10.0,
     slippage_bps: float = 5.0,
-    annualization: int = 252,
+    period: Optional[Literal["1h", "1d"]] = None,
+    annualization: Optional[int] = None,
 ):
     """
-    Backtest endpoint (lookahead-safe, simple + credible).
-    fee_bps/slippage_bps: basis points per position change.
-    annualization: 252 for daily bars, 365 for crypto daily, etc.
+    Backtest endpoint.
+    - period: optional override ('1h' or '1d'). If omitted, inferred from index deltas.
+    - annualization: optional override. If omitted, derived from period/inference.
     """
     t0 = time.time()
     _emit_metric("BacktestRequest", 1, asset=asset, mode=mode)
@@ -545,24 +545,24 @@ def backtest(
             df = generate_combined_signal(df, sent)
             signal_col = "signal_combined"
 
+        inferred = _infer_bar_interval(df.index)
+        bar_interval = period or inferred
+        ann = int(annualization) if annualization is not None else _default_annualization(bar_interval)
+
         result = _run_backtest(
             df=df,
             signal_col=signal_col,
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
-            annualization=annualization,
+            annualization=ann,
         )
 
-        _emit_metric(
-            "BacktestLatencyMs",
-            (time.time() - t0) * 1000,
-            unit="Milliseconds",
-            asset=asset,
-            mode=mode,
-        )
+        _emit_metric("BacktestLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+
         return {
             "asset": asset,
             "mode": mode,
+            "bar_interval": bar_interval,
             **result,
         }
 
@@ -570,10 +570,7 @@ def backtest(
         reason = type(e).__name__
         _emit_metric("BacktestError", 1, asset=asset, mode=mode, reason=reason)
         print(f"BACKTEST_ERROR — asset={asset} mode={mode} reason={reason} err={e}")
-        return JSONResponse(
-            status_code=503,
-            content={"detail": f"Backtest unavailable for asset {asset}"},
-        )
+        return JSONResponse(status_code=503, content={"detail": f"Backtest unavailable for asset {asset}"})
 
 @app.get("/debug/cache/read")
 def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
@@ -587,13 +584,7 @@ def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
     cached = read_latest_signal(asset, mode)
 
     if not cached:
-        return {
-            "enabled": True,
-            "found": False,
-            "bucket": bucket,
-            "key": key,
-            "ttl_seconds": ttl,
-        }
+        return {"enabled": True, "found": False, "bucket": bucket, "key": key, "ttl_seconds": ttl}
 
     age = _age_seconds(cached.get("cached_at", ""))
 
