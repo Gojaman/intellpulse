@@ -24,7 +24,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.3")
+app = FastAPI(title="Intellpulse API", version="0.2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,6 +102,24 @@ def _is_fresh(iso: str, ttl: int) -> bool:
     age = _age_seconds(iso)
     return age is not None and age <= ttl
 
+def _load_price_pipeline(asset: str):
+    """
+    Load price data using the correct loader signature.
+    If missing, return 404 (never 500).
+    """
+    symbol_filter = asset.replace("-", "_")  # BTC-USD -> BTC_USD
+    try:
+        price = load_price_data(symbol_filter=symbol_filter)
+    except FileNotFoundError as e:
+        _emit_metric("PriceDataMissing", 1, asset=asset)
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"Price data not found for {asset} ({symbol_filter}). {str(e)}"},
+        )
+
+    feat = build_price_feature_set(price)
+    return generate_rule_based_signal(feat)
+
 # -------------------------
 # Sentiment
 # -------------------------
@@ -131,8 +149,8 @@ class SignalResponse(BaseModel):
     latest_timestamp: str
     latest_signal: int
     latest_signal_text: Literal["BUY", "HOLD", "SELL"]
-    latest_sentiment: Optional[float]
-    cached_at_utc: Optional[str]
+    latest_sentiment: Optional[float] = None
+    cached_at_utc: Optional[str] = None
 
 # -------------------------
 # Routes
@@ -144,10 +162,11 @@ def health():
 @app.get("/signal", response_model=SignalResponse)
 def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined"):
     t0 = time.time()
-    _emit_metric("SignalRequest", asset=asset, mode=mode)
+    _emit_metric("SignalRequest", 1, asset=asset, mode=mode)
 
     ttl = _cache_ttl_seconds()
 
+    # Cache read (best effort)
     try:
         bucket = cache_bucket()
         cached = read_latest_signal(asset, mode)
@@ -156,7 +175,8 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
         cached = None
 
     if cached and _is_fresh(cached.get("cached_at", ""), ttl):
-        _emit_metric("CacheHit", asset=asset, mode=mode)
+        _emit_metric("CacheHit", 1, asset=asset, mode=mode)
+        _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
         return SignalResponse(
             asset=asset,
             mode=mode,
@@ -167,15 +187,16 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
             cached_at_utc=cached.get("cached_at"),
         )
 
-    _emit_metric("CacheMiss", asset=asset, mode=mode)
+    _emit_metric("CacheMiss", 1, asset=asset, mode=mode)
 
-    price = load_price_data(asset.replace("-", "_"))
-    feat = build_price_feature_set(price)
-    price_sig = generate_rule_based_signal(feat)
+    # Compute (and handle missing price data cleanly)
+    price_sig = _load_price_pipeline(asset)
+    if isinstance(price_sig, JSONResponse):
+        return price_sig  # 404 response
 
     latest_ts = price_sig.index[-1]
     latest_signal = int(price_sig["signal"].iloc[-1])
-    latest_sentiment = None
+    latest_sentiment: Optional[float] = None
 
     if mode == "combined":
         sent = _load_aligned_sentiment(asset, price_sig)
@@ -195,10 +216,23 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
         cached_at_utc=cached_at,
     )
 
+    # Cache write (best effort)
     if bucket:
-        write_latest_signal(asset, mode, resp.dict())
+        payload = {
+            "asset": resp.asset,
+            "mode": resp.mode,
+            "latest_timestamp": resp.latest_timestamp,
+            "latest_signal": resp.latest_signal,
+            "latest_sentiment": resp.latest_sentiment,
+            "cached_at": cached_at,  # IMPORTANT: reader expects cached_at
+        }
+        try:
+            write_latest_signal(asset, mode, payload)
+            _emit_metric("CacheWrite", 1, asset=asset, mode=mode)
+        except Exception:
+            _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
 
-    _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds")
+    _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
     return resp
 
 @app.get("/debug/cache/read")
