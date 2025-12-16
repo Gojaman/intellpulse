@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict, Any, List
 
 import boto3
 import httpx
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +25,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.5")
+app = FastAPI(title="Intellpulse API", version="0.2.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,9 +117,6 @@ def _dump(model_obj) -> dict:
     return dict(model_obj)
 
 def _extract_latest_features(df: pd.DataFrame) -> dict:
-    """
-    Keep this compact: only include a small set of useful, stable columns if present.
-    """
     preferred = [
         "close",
         "ma_20",
@@ -126,6 +124,8 @@ def _extract_latest_features(df: pd.DataFrame) -> dict:
         "rsi_14",
         "return_1d",
         "volatility_20",
+        "return",
+        "vol_20",
     ]
     out = {}
     if df is None or len(df) == 0:
@@ -159,7 +159,7 @@ def _build_explain(
 
     if features:
         shown = []
-        for k in ["close", "ma_20", "rsi_14", "return_1d"]:
+        for k in ["close", "ma_20", "rsi_14"]:
             if k in features:
                 shown.append(f"{k}={features[k]:.4f}")
         if shown:
@@ -216,14 +216,152 @@ def _get_fear_greed_score() -> float:
         v = float(r.json()["data"][0]["value"])
         return max(0.0, min(1.0, v / 100.0))
     except Exception:
-        # keep API stable if sentiment fails
-        return 0.5
+        return 0.5  # stable fallback
 
 def _load_aligned_sentiment(asset: str, price_df):
     return pd.DataFrame(
         index=price_df.index,
         data={"sentiment_score": _get_fear_greed_score()},
     )
+
+# -------------------------
+# Backtest helpers
+# -------------------------
+def _max_drawdown(equity: pd.Series) -> float:
+    if equity is None or len(equity) == 0:
+        return 0.0
+    peak = equity.cummax()
+    dd = (equity / peak) - 1.0
+    return float(dd.min())
+
+def _trade_stats(position: pd.Series, strat_ret: pd.Series) -> Dict[str, Any]:
+    """
+    Very lightweight trade stats.
+    We consider a "trade" whenever position goes from 0 -> nonzero and ends when it returns to 0.
+    """
+    pos = position.fillna(0).astype(int)
+    r = strat_ret.fillna(0.0)
+
+    in_trade = False
+    trade_pnls: List[float] = []
+    cur = 1.0
+
+    for i in range(len(pos)):
+        p = int(pos.iloc[i])
+        ri = float(r.iloc[i])
+
+        if not in_trade and p != 0:
+            # enter trade
+            in_trade = True
+            cur = 1.0
+
+        if in_trade:
+            cur *= (1.0 + ri)
+
+        if in_trade and p == 0:
+            # exit trade
+            in_trade = False
+            trade_pnls.append(cur - 1.0)
+
+    # if still in trade at end, close it
+    if in_trade:
+        trade_pnls.append(cur - 1.0)
+
+    if not trade_pnls:
+        return {"trades": 0, "win_rate": 0.0}
+
+    wins = sum(1 for x in trade_pnls if x > 0)
+    return {
+        "trades": int(len(trade_pnls)),
+        "win_rate": float(wins / len(trade_pnls)),
+    }
+
+def _run_backtest(
+    df: pd.DataFrame,
+    signal_col: str,
+    fee_bps: float,
+    slippage_bps: float,
+    annualization: int,
+) -> Dict[str, Any]:
+    """
+    Backtest using next-bar execution (lookahead-safe):
+      position[t] = signal[t-1]
+    Uses log returns column: 'return' from your feature pipeline.
+    Converts to simple returns for equity compounding.
+    Costs are applied on position changes:
+      cost = abs(delta_position) * (fee+slippage) / 10000
+    """
+    if "return" not in df.columns:
+        raise ValueError("DataFrame must contain 'return' (log returns) column")
+
+    if signal_col not in df.columns:
+        raise ValueError(f"DataFrame must contain '{signal_col}' column")
+
+    work = df.copy()
+
+    # log -> simple returns
+    work["ret_simple"] = np.expm1(work["return"].astype(float))
+
+    # positions (lookahead-safe)
+    sig = work[signal_col].fillna(0).astype(int)
+    pos = sig.shift(1).fillna(0).astype(int)
+    work["position"] = pos
+
+    # transaction costs on position changes
+    total_cost_bps = float(fee_bps) + float(slippage_bps)
+    cost_rate = total_cost_bps / 10000.0
+
+    dpos = pos.diff().fillna(pos).abs()  # first bar: entering counts as abs(pos)
+    work["cost"] = dpos.astype(float) * cost_rate
+
+    # strategy returns
+    work["strategy_ret"] = (pos.astype(float) * work["ret_simple"]) - work["cost"]
+
+    # equity curve
+    work["equity"] = (1.0 + work["strategy_ret"]).cumprod()
+
+    strat = work["strategy_ret"].dropna()
+    eq = work["equity"].dropna()
+
+    if len(strat) < 5 or len(eq) < 5:
+        return {
+            "detail": "Not enough data to backtest (need more rows after feature dropna).",
+            "rows": int(len(work)),
+        }
+
+    mean_r = float(strat.mean())
+    std_r = float(strat.std(ddof=0))
+    vol = float(std_r * np.sqrt(annualization)) if std_r > 0 else 0.0
+    sharpe = float((mean_r / std_r) * np.sqrt(annualization)) if std_r > 0 else 0.0
+
+    total_return = float(eq.iloc[-1] - 1.0)
+    mdd = _max_drawdown(eq)
+    trade_stats = _trade_stats(work["position"], work["strategy_ret"])
+
+    # sample equity points for UI (last 50)
+    tail = work[["equity"]].tail(50).copy()
+    equity_points = [
+        {"t": idx.isoformat(), "equity": float(val)}
+        for idx, val in zip(tail.index, tail["equity"].values)
+    ]
+
+    return {
+        "rows": int(len(work)),
+        "signal_col": signal_col,
+        "fee_bps": float(fee_bps),
+        "slippage_bps": float(slippage_bps),
+        "annualization": int(annualization),
+        "total_return": total_return,
+        "volatility": vol,
+        "sharpe": sharpe,
+        "max_drawdown": mdd,
+        "trades": trade_stats["trades"],
+        "win_rate": trade_stats["win_rate"],
+        "equity_end": float(eq.iloc[-1]),
+        "equity_points": equity_points,
+        "period_start": work.index.min().isoformat() if len(work) else None,
+        "period_end": work.index.max().isoformat() if len(work) else None,
+    }
 
 # -------------------------
 # Schemas
@@ -273,6 +411,7 @@ def get_signal(
     age = _age_seconds(cached_at_val) if cached else None
     fresh = _is_fresh(cached_at_val, ttl) if cached else False
 
+    # NOTE: bypass cache when explain=1
     if cached and fresh and explain != 1:
         _emit_metric("CacheHit", 1, asset=asset, mode=mode)
         if age is not None:
@@ -305,7 +444,6 @@ def get_signal(
 
     # Compute section (hardened)
     try:
-        # Compute (and handle missing price data cleanly)
         price_sig = _load_price_pipeline(asset)
         if isinstance(price_sig, JSONResponse):
             return price_sig  # 404 response
@@ -315,7 +453,6 @@ def get_signal(
         latest_sentiment: Optional[float] = None
 
         if mode == "combined":
-            # sentiment failures already default to 0.5 inside _get_fear_greed_score
             sent = _load_aligned_sentiment(asset, price_sig)
             combined = generate_combined_signal(price_sig, sent)
             latest_signal = int(combined["signal_combined"].iloc[-1])
@@ -364,7 +501,6 @@ def get_signal(
         return resp
 
     except Exception as e:
-        # Never 500: return a clean, demo-safe 503 and emit SignalError
         reason = type(e).__name__
         _emit_metric("SignalError", 1, asset=asset, mode=mode, reason=reason)
         print(f"SIGNAL_ERROR — asset={asset} mode={mode} reason={reason} err={e}")
@@ -378,8 +514,66 @@ def get_signal_explain(
     asset: str = "BTC-USD",
     mode: Literal["price_only", "combined"] = "combined",
 ):
-    # Protected by middleware (same as /signal). Just force explain=1.
     return get_signal(asset=asset, mode=mode, explain=1)
+
+@app.get("/backtest")
+def backtest(
+    asset: str = "BTC-USD",
+    mode: Literal["price_only", "combined"] = "combined",
+    fee_bps: float = 10.0,
+    slippage_bps: float = 5.0,
+    annualization: int = 252,
+):
+    """
+    Backtest endpoint (lookahead-safe, simple + credible).
+    fee_bps/slippage_bps: basis points per position change.
+    annualization: 252 for daily bars, 365 for crypto daily, etc.
+    """
+    t0 = time.time()
+    _emit_metric("BacktestRequest", 1, asset=asset, mode=mode)
+
+    try:
+        price_sig = _load_price_pipeline(asset)
+        if isinstance(price_sig, JSONResponse):
+            return price_sig
+
+        df = price_sig
+        signal_col = "signal"
+
+        if mode == "combined":
+            sent = _load_aligned_sentiment(asset, df)
+            df = generate_combined_signal(df, sent)
+            signal_col = "signal_combined"
+
+        result = _run_backtest(
+            df=df,
+            signal_col=signal_col,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            annualization=annualization,
+        )
+
+        _emit_metric(
+            "BacktestLatencyMs",
+            (time.time() - t0) * 1000,
+            unit="Milliseconds",
+            asset=asset,
+            mode=mode,
+        )
+        return {
+            "asset": asset,
+            "mode": mode,
+            **result,
+        }
+
+    except Exception as e:
+        reason = type(e).__name__
+        _emit_metric("BacktestError", 1, asset=asset, mode=mode, reason=reason)
+        print(f"BACKTEST_ERROR — asset={asset} mode={mode} reason={reason} err={e}")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"Backtest unavailable for asset {asset}"},
+        )
 
 @app.get("/debug/cache/read")
 def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
