@@ -6,12 +6,15 @@ env:
     AWS_ACCOUNT_ID: "528757798791"
     REPO_NAME: "intellpulse-api"
     IMAGE_TAG: "latest"
+
     STG_FN: "intellpulse-api-staging"
     STG_URL: "https://hrimhqter7wxdiwzcwiwmo5ubu0xplqb.lambda-url.us-east-1.on.aws"
+
     PROD_FN: "intellpulse-api"
+
     API_KEY: "REPLACE_ME_API_KEY"
 
-    # Quota defaults
+    # Quota defaults (staging)
     QUOTA_ENABLED: "1"
     QUOTA_TABLE: "intellpulse-rate-limit"
     QUOTA_DAILY_LIMIT: "2000"
@@ -41,6 +44,9 @@ phases:
       - "DIGEST=$(aws ecr describe-images --region \"$AWS_REGION\" --repository-name \"$REPO_NAME\" --image-ids imageTag=\"$IMAGE_TAG\" --query \"imageDetails[0].imageDigest\" --output text)"
       - "echo \"New digest: $DIGEST\""
 
+      # -------------------------
+      # Deploy STAGING
+      # -------------------------
       - "echo \"Deploying to STAGING: $STG_FN\""
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
       - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\" || (aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" && aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\")"
@@ -51,20 +57,21 @@ phases:
       - "STG_ENV_JSON=$(aws lambda get-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --query 'Environment.Variables' --output json)"
       - "echo \"STG env vars fetched.\""
 
-      - "echo \"Writing merged env vars with QUOTA_* enabled...\""
+      - "echo \"Writing merged STAGING env vars with QUOTA_* enabled...\""
       - |
-        python - <<'PY'
+        python - <<'PY' > merged_env_payload.json
         import json, os
         env = json.loads(os.environ["STG_ENV_JSON"])
         env["QUOTA_ENABLED"] = os.environ.get("QUOTA_ENABLED", "1")
         env["QUOTA_TABLE"] = os.environ.get("QUOTA_TABLE", "intellpulse-rate-limit")
         env["QUOTA_DAILY_LIMIT"] = os.environ.get("QUOTA_DAILY_LIMIT", "2000")
-        print(json.dumps(env))
+        print(json.dumps({"Variables": env}))
         PY
-        > merged_env.json
-      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment \"Variables=$(cat merged_env.json)\""
+      - "cat merged_env_payload.json"
+      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment file://merged_env_payload.json"
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
+      # --- Staging smoke tests ---
       - "echo \"Staging smoke test: /signal (authenticated)\""
       - "RESP=$(curl -fsS -H \"x-api-key: $API_KEY\" \"${STG_URL%/}/signal?asset=BTC-USD&mode=combined\")"
       - "echo \"$RESP\" | grep -q '\"latest_signal_text\"'"
@@ -76,19 +83,19 @@ phases:
       - "echo \"$RESP2\" | grep -q '\"enabled\"'"
       - "echo \"Staging /debug/cache/read OK\""
 
-      # --- Quota behavior test (staging only): set limit=5 temporarily, then restore ---
+      # --- Quota behavior test (staging only): set limit=5 temporarily ---
       - "echo \"Staging quota test: set QUOTA_DAILY_LIMIT=5 temporarily\""
       - |
-        python - <<'PY'
+        python - <<'PY' > quota_test_env_payload.json
         import json, os
         env = json.loads(os.environ["STG_ENV_JSON"])
         env["QUOTA_ENABLED"] = "1"
         env["QUOTA_TABLE"] = os.environ.get("QUOTA_TABLE", "intellpulse-rate-limit")
         env["QUOTA_DAILY_LIMIT"] = "5"
-        print(json.dumps(env))
+        print(json.dumps({"Variables": env}))
         PY
-        > quota_test_env.json
-      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment \"Variables=$(cat quota_test_env.json)\""
+      - "cat quota_test_env_payload.json"
+      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment file://quota_test_env_payload.json"
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
       - "echo \"Calling /signal 7 times; expect first 5 = 200, then 429\""
@@ -106,20 +113,24 @@ phases:
         if [ "$ok429" -lt 1 ]; then echo "Quota test failed: expected at least one 429"; exit 1; fi
         echo "Staging quota behavior OK"
 
-      - "echo \"Restoring staging quota limit back to $QUOTA_DAILY_LIMIT\""
+      # --- Restore staging quota limit ---
+      - "echo \"Restoring STAGING quota limit back to $QUOTA_DAILY_LIMIT\""
       - |
-        python - <<'PY'
+        python - <<'PY' > quota_restore_env_payload.json
         import json, os
         env = json.loads(os.environ["STG_ENV_JSON"])
         env["QUOTA_ENABLED"] = os.environ.get("QUOTA_ENABLED", "1")
         env["QUOTA_TABLE"] = os.environ.get("QUOTA_TABLE", "intellpulse-rate-limit")
         env["QUOTA_DAILY_LIMIT"] = os.environ.get("QUOTA_DAILY_LIMIT", "2000")
-        print(json.dumps(env))
+        print(json.dumps({"Variables": env}))
         PY
-        > quota_restore_env.json
-      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment \"Variables=$(cat quota_restore_env.json)\""
+      - "cat quota_restore_env_payload.json"
+      - "aws lambda update-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --environment file://quota_restore_env_payload.json"
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
+      # -------------------------
+      # Deploy PROD
+      # -------------------------
       - "echo \"Deploying to PROD: $PROD_FN\""
       - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"
       - "aws lambda update-function-code --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\" || (aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" && aws lambda update-function-code --function-name \"$PROD_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\")"
