@@ -11,6 +11,7 @@ import boto3
 import httpx
 import numpy as np
 import pandas as pd
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -27,7 +28,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.9")
+app = FastAPI(title="Intellpulse API", version="0.2.10")
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,6 +75,10 @@ def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> 
 PUBLIC_PATHS = {"/health"}
 
 def _key_hash(x_api_key: Optional[str]) -> str:
+    """
+    Privacy-safe identifier for usage tracking.
+    Never emit/store raw API keys.
+    """
     if not x_api_key:
         return "unknown"
     return hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()[:12]
@@ -96,7 +101,6 @@ def _utc_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def _quota_key(day: str, key_hash: str) -> str:
-    # Keep this separate from signals/ so it's clean.
     return f"quota/daily/{day}/{key_hash}.json"
 
 def _s3_read_json(bucket: str, key: str) -> Optional[dict]:
@@ -104,7 +108,10 @@ def _s3_read_json(bucket: str, key: str) -> Optional[dict]:
         obj = _s3.get_object(Bucket=bucket, Key=key)
         raw = obj["Body"].read()
         return json.loads(raw.decode("utf-8"))
-    except _s3.exceptions.NoSuchKey:  # type: ignore
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return None
         return None
     except Exception:
         return None
@@ -115,12 +122,13 @@ def _s3_write_json(bucket: str, key: str, payload: dict) -> None:
         Key=key,
         Body=json.dumps(payload).encode("utf-8"),
         ContentType="application/json",
+        ServerSideEncryption="AES256",
     )
 
 def _enforce_quota(endpoint: str, key_hash: str) -> Optional[JSONResponse]:
     """
     Returns a 429 JSONResponse if quota exceeded, else None.
-    Fail-open if bucket isn't available or S3 errors occur.
+    FAIL-OPEN: quota must never break traffic.
     """
     q = _daily_quota()
     if q <= 0:
@@ -128,29 +136,39 @@ def _enforce_quota(endpoint: str, key_hash: str) -> Optional[JSONResponse]:
 
     try:
         bucket = cache_bucket()
-    except Exception:
-        return None  # fail-open
+        day = _utc_day()
+        k = _quota_key(day, key_hash)
 
-    day = _utc_day()
-    k = _quota_key(day, key_hash)
+        current = _s3_read_json(bucket, k) or {}
+        count = int(current.get("count", 0))
 
-    current = _s3_read_json(bucket, k) or {}
-    count = int(current.get("count", 0))
+        if count >= q:
+            _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=key_hash)
+            return JSONResponse({"detail": "Daily quota exceeded"}, status_code=429)
 
-    if count >= q:
-        _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=key_hash)
-        return JSONResponse({"detail": "Daily quota exceeded"}, status_code=429)
+        count += 1
+        _s3_write_json(
+            bucket,
+            k,
+            {
+                "day": day,
+                "key_hash": key_hash,
+                "count": count,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return None
 
-    # increment (best-effort; race conditions acceptable for MVP)
-    count += 1
-    _s3_write_json(bucket, k, {"day": day, "key_hash": key_hash, "count": count, "updated_at": datetime.now(timezone.utc).isoformat()})
-
-    return None
+    except Exception as e:
+        print(f"QUOTA_WARN — endpoint={endpoint} key_hash={key_hash} err={e}")
+        _emit_metric("QuotaError", 1, endpoint=endpoint)
+        return None
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     endpoint = _endpoint_name(request.url.path)
 
+    # Public paths bypass
     if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
 
@@ -172,7 +190,7 @@ async def api_key_middleware(request: Request, call_next):
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
-    # Soft quota (enforced per key_hash per UTC day)
+    # Soft quota (per key_hash per UTC day)
     quota_resp = _enforce_quota(endpoint=endpoint, key_hash=request.state.key_hash)
     if quota_resp is not None:
         return quota_resp
@@ -200,6 +218,10 @@ def _is_fresh(iso: str, ttl: int) -> bool:
     return age is not None and age <= ttl
 
 def _dump(model_obj) -> dict:
+    """
+    Pydantic v2: model_dump()
+    Pydantic v1: dict()
+    """
     if model_obj is None:
         return {}
     if hasattr(model_obj, "model_dump"):
@@ -270,6 +292,10 @@ def _build_explain(
     return ExplainBlock(summary=" | ".join(parts), facts=facts)
 
 def _load_price_pipeline(asset: str):
+    """
+    Load price data using the correct loader signature.
+    If missing, return 404 (never 500).
+    """
     symbol_filter = asset.replace("-", "_")  # BTC-USD -> BTC_USD
     try:
         price = load_price_data(symbol_filter=symbol_filter)
@@ -295,7 +321,7 @@ def _get_fear_greed_score() -> float:
         v = float(r.json()["data"][0]["value"])
         return max(0.0, min(1.0, v / 100.0))
     except Exception:
-        return 0.5
+        return 0.5  # stable fallback
 
 def _load_aligned_sentiment(asset: str, price_df):
     return pd.DataFrame(index=price_df.index, data={"sentiment_score": _get_fear_greed_score()})
@@ -390,6 +416,7 @@ def _run_backtest(
 
     work["strategy_ret"] = (pos.astype(float) * work["ret_simple"]) - work["cost"]
     work["equity"] = (1.0 + work["strategy_ret"]).cumprod()
+
     work["buy_hold_equity"] = (1.0 + work["ret_simple"]).cumprod()
 
     strat = work["strategy_ret"].dropna()
@@ -456,7 +483,7 @@ class SignalResponse(BaseModel):
     latest_signal: int
     latest_signal_text: Literal["BUY", "HOLD", "SELL"]
     latest_sentiment: Optional[float] = None
-    cached_at_utc: Optional[float] = None
+    cached_at_utc: Optional[str] = None
     explain: Optional[ExplainBlock] = None
 
 # -------------------------
@@ -477,6 +504,7 @@ def get_signal(
 
     ttl = _cache_ttl_seconds()
 
+    # Cache read (best effort)
     try:
         bucket = cache_bucket()
         cached = read_latest_signal(asset, mode)
@@ -488,6 +516,7 @@ def get_signal(
     age = _age_seconds(cached_at_val) if cached else None
     fresh = _is_fresh(cached_at_val, ttl) if cached else False
 
+    # Serve cached if fresh and not forcing explain recompute
     if cached and fresh and explain != 1:
         _emit_metric("CacheHit", 1, asset=asset, mode=mode)
         if age is not None:
@@ -512,10 +541,11 @@ def get_signal(
     if cached and age is not None:
         _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
 
+    # Compute (with hardening)
     try:
         price_sig = _load_price_pipeline(asset)
         if isinstance(price_sig, JSONResponse):
-            return price_sig
+            return price_sig  # 404 response
 
         latest_ts = price_sig.index[-1]
         latest_signal = int(price_sig["signal"].iloc[-1])
@@ -543,6 +573,7 @@ def get_signal(
         if explain == 1:
             resp.explain = _build_explain(asset, mode, price_sig, latest_signal, latest_sentiment)
 
+        # Cache write (best effort)
         if bucket:
             payload = {
                 "asset": resp.asset,
@@ -569,7 +600,10 @@ def get_signal(
         return JSONResponse(status_code=503, content={"detail": f"Data unavailable for asset {asset}"})
 
 @app.get("/signal/explain", response_model=SignalResponse)
-def get_signal_explain(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined"):
+def get_signal_explain(
+    asset: str = "BTC-USD",
+    mode: Literal["price_only", "combined"] = "combined",
+):
     return get_signal(asset=asset, mode=mode, explain=1)
 
 @app.get("/backtest")
@@ -611,12 +645,7 @@ def backtest(
 
         _emit_metric("BacktestLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
 
-        return {
-            "asset": asset,
-            "mode": mode,
-            "bar_interval": bar_interval,
-            **result,
-        }
+        return {"asset": asset, "mode": mode, "bar_interval": bar_interval, **result}
 
     except Exception as e:
         reason = type(e).__name__
@@ -636,7 +665,13 @@ def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
     cached = read_latest_signal(asset, mode)
 
     if not cached:
-        return {"enabled": True, "found": False, "bucket": bucket, "key": key, "ttl_seconds": ttl}
+        return {
+            "enabled": True,
+            "found": False,
+            "bucket": bucket,
+            "key": key,
+            "ttl_seconds": ttl,
+        }
 
     age = _age_seconds(cached.get("cached_at", ""))
 
