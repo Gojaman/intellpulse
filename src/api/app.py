@@ -267,7 +267,7 @@ def get_signal(
         bucket = None
         cached = None
 
-    if cached and _is_fresh(cached.get("cached_at", ""), ttl):
+    if cached and _is_fresh(cached.get("cached_at", ""), ttl) and explain != 1:
         _emit_metric("CacheHit", 1, asset=asset, mode=mode)
         _emit_metric(
             "SignalLatencyMs",
