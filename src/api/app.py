@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
+from functools import lru_cache
 from typing import Literal, Optional
 
 import boto3
@@ -38,10 +40,11 @@ app.add_middleware(
 )
 
 # -------------------------
-# CloudWatch Metrics + DynamoDB
+# CloudWatch Metrics + DynamoDB + Secrets Manager
 # -------------------------
 _cw = boto3.client("cloudwatch")
 _ddb = boto3.client("dynamodb")
+_sm = boto3.client("secretsmanager")
 
 METRICS_NS = os.getenv("METRICS_NAMESPACE", "Intellpulse/MVP1")
 SERVICE_NAME = os.getenv(
@@ -70,6 +73,42 @@ def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> 
         )
     except Exception as e:
         print(f"METRICS_WARN — {e}")
+
+
+# -------------------------
+# Secrets (API key + Admin key)
+# -------------------------
+API_KEY_SECRET_ARN = os.getenv("API_KEY_SECRET_ARN", "").strip()
+ADMIN_KEY_SECRET_ARN = os.getenv("ADMIN_KEY_SECRET_ARN", "").strip()
+
+
+@lru_cache(maxsize=32)
+def _get_secret_string(secret_id: str) -> str:
+    if not secret_id:
+        return ""
+    try:
+        resp = _sm.get_secret_value(SecretId=secret_id)
+        s = resp.get("SecretString") or ""
+        # Support raw string OR {"value": "..."} JSON
+        if s and s.strip().startswith("{"):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    return str(obj.get("value") or obj.get("secret") or obj.get("key") or s)
+            except Exception:
+                pass
+        return s
+    except Exception as e:
+        print(f"SECRETS_WARN — {e}")
+        return ""
+
+
+def _get_api_key() -> str:
+    return _get_secret_string(API_KEY_SECRET_ARN) or os.getenv("API_KEY", "")
+
+
+def _get_admin_key() -> str:
+    return _get_secret_string(ADMIN_KEY_SECRET_ARN) or os.getenv("ADMIN_KEY", "")
 
 
 # -------------------------
@@ -274,7 +313,6 @@ def _quota_allow_request_with_limit(
 PUBLIC_PATHS = {"/health"}
 ADMIN_PATHS = {"/admin/plan"}
 
-ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()  # e.g. "1.2.3.4/32,5.6.7.0/24"
 
 
@@ -309,10 +347,11 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
     """
     Admin auth for /admin/* endpoints.
     Requires BOTH:
-      - x-admin-key header matches env ADMIN_KEY
+      - x-admin-key header matches ADMIN_KEY (Secrets Manager preferred)
       - request.client.host is in ADMIN_IP_ALLOWLIST (if configured)
     """
-    if not ADMIN_KEY:
+    admin_key = _get_admin_key()
+    if not admin_key:
         return JSONResponse({"detail": "ADMIN_KEY not configured"}, status_code=503)
 
     client_ip = getattr(getattr(request, "client", None), "host", None)
@@ -321,7 +360,7 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     provided = request.headers.get("x-admin-key", "")
-    if provided != ADMIN_KEY:
+    if provided != admin_key:
         _emit_metric("AdminUnauthorized", 1, endpoint=request.url.path)
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
@@ -379,7 +418,7 @@ async def api_key_middleware(request: Request, call_next):
         return await call_next(request)
 
     # Normal API-key protected endpoints
-    api_key = os.getenv("API_KEY")
+    api_key = _get_api_key()
     provided = request.headers.get("x-api-key")
 
     # If API_KEY not set, allow (dev mode)
