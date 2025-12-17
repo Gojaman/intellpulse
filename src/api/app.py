@@ -101,7 +101,6 @@ def _get_secret_string(secret_id: str) -> str:
             try:
                 obj = json.loads(s)
                 if isinstance(obj, dict):
-                    # Common keys
                     return str(
                         obj.get("value")
                         or obj.get("secret")
@@ -120,12 +119,10 @@ def _get_secret_string(secret_id: str) -> str:
 
 
 def _get_api_key() -> str:
-    # Prefer Secrets Manager; fallback to env for dev
     return _get_secret_string(API_KEY_SECRET_ARN) or os.getenv("API_KEY", "")
 
 
 def _get_admin_key() -> str:
-    # Prefer Secrets Manager; fallback to env for dev
     return _get_secret_string(ADMIN_KEY_SECRET_ARN) or os.getenv("ADMIN_KEY", "")
 
 
@@ -137,8 +134,6 @@ GLOBAL_RATE_ENABLED = os.getenv("GLOBAL_RATE_LIMIT_ENABLED", "0") == "1"
 GLOBAL_RPS = float(os.getenv("GLOBAL_RATE_LIMIT_RPS", "3"))  # sustained
 GLOBAL_BURST = float(os.getenv("GLOBAL_RATE_LIMIT_BURST", "10"))  # extra headroom
 GLOBAL_TTL_SECONDS = int(os.getenv("GLOBAL_RATE_LIMIT_TTL_SECONDS", "3600"))
-
-# Window length in seconds (60 = per-minute quotas; easiest to validate)
 GLOBAL_WINDOW_SECONDS = int(os.getenv("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 
@@ -151,12 +146,6 @@ def _epoch_s() -> int:
 
 
 def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
-    """
-    Global limiter using a DynamoDB counter per fixed time window.
-
-    Limit per window = GLOBAL_RPS*window + GLOBAL_BURST
-    Example: rps=3, window=60 => 180 + 10 = 190 requests/min allowed.
-    """
     if not GLOBAL_RATE_ENABLED:
         return True
 
@@ -181,10 +170,8 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
             },
         )
         return True
-
     except _ddb.exceptions.ConditionalCheckFailedException:
         return False
-
     except Exception as e:
         print(f"RATE_LIMIT_DDB_WARN — {e}")
         _emit_metric("RateLimitDdbError", 1, endpoint=endpoint, key_hash=key_hash)
@@ -195,10 +182,8 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
 # Usage quotas (DynamoDB) — daily counter per API key
 # -------------------------
 QUOTA_ENABLED = os.getenv("QUOTA_ENABLED", "0") == "1"
-QUOTA_TABLE = os.getenv("QUOTA_TABLE", RATE_TABLE)  # default reuse rate table
+QUOTA_TABLE = os.getenv("QUOTA_TABLE", RATE_TABLE)
 QUOTA_DAILY_LIMIT = int(os.getenv("QUOTA_DAILY_LIMIT", "2000"))
-
-# Endpoints that count against daily quota
 BILLABLE_PATHS = {"/signal", "/signal/explain", "/backtest"}
 
 
@@ -208,9 +193,7 @@ def _utc_yyyymmdd() -> str:
 
 def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
     now = datetime.now(timezone.utc)
-    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(
-        days=1
-    )
+    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
     return int((tomorrow_midnight + timedelta(minutes=extra_minutes)).timestamp())
 
 
@@ -222,16 +205,11 @@ def _quota_pk(key_hash: str) -> str:
 # Plans mapping (DynamoDB) — key_hash -> plan -> daily_limit
 # -------------------------
 PLAN_ENABLED = os.getenv("PLAN_ENABLED", "1") == "1"
-PLAN_CACHE_SECONDS = int(os.getenv("PLAN_CACHE_SECONDS", "60"))  # allow 0 to disable cache
+PLAN_CACHE_SECONDS = int(os.getenv("PLAN_CACHE_SECONDS", "60"))
 PLAN_DEBUG = os.getenv("PLAN_DEBUG", "0") == "1"
 
-PLAN_DEFAULTS = {
-    "free": 200,
-    "pro": 2000,
-    "enterprise": 10000,
-}
-
-_plan_cache: dict[str, dict] = {}  # key_hash -> {"limit": int, "plan": str, "exp": epoch}
+PLAN_DEFAULTS = {"free": 200, "pro": 2000, "enterprise": 10000}
+_plan_cache: dict[str, dict] = {}
 
 
 def _plan_pk(key_hash: str) -> str:
@@ -239,12 +217,6 @@ def _plan_pk(key_hash: str) -> str:
 
 
 def _plan_get_limit(key_hash: str) -> tuple[str, int]:
-    """
-    Returns (plan_name, daily_limit).
-
-    Cache can be disabled by setting PLAN_CACHE_SECONDS=0.
-    Fail-open to QUOTA_DAILY_LIMIT on DDB errors.
-    """
     if not PLAN_ENABLED:
         return ("pro", int(QUOTA_DAILY_LIMIT))
 
@@ -276,11 +248,7 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
             limit = int(PLAN_DEFAULTS.get(plan, limit))
 
         if PLAN_CACHE_SECONDS > 0:
-            _plan_cache[key_hash] = {
-                "plan": plan,
-                "limit": limit,
-                "exp": now + PLAN_CACHE_SECONDS,
-            }
+            _plan_cache[key_hash] = {"plan": plan, "limit": limit, "exp": now + PLAN_CACHE_SECONDS}
 
         if PLAN_DEBUG:
             print(f"PLAN_DEBUG key_hash={key_hash} plan={plan} limit={limit}")
@@ -293,9 +261,7 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
         return ("pro", int(QUOTA_DAILY_LIMIT))
 
 
-def _quota_allow_request_with_limit(
-    key_hash: str, endpoint: str, daily_limit: int, cost: int = 1
-) -> bool:
+def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: int, cost: int = 1) -> bool:
     if not QUOTA_ENABLED:
         return True
 
@@ -331,18 +297,15 @@ def _quota_allow_request_with_limit(
 PUBLIC_PATHS = {"/health"}
 ADMIN_PATHS = {"/admin/plan"}
 
-ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()  # "1.2.3.4/32,5.6.7.0/24"
+ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()
 
 
 def _sha256_12(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12
+    # ✅ FIXED: missing closing bracket caused Lambda import crash (502)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
 
 def _ip_allowed(ip: Optional[str]) -> bool:
-    """
-    If ADMIN_IP_ALLOWLIST is empty => allow (backward compatible).
-    Otherwise require the client IP to be in one of the CIDRs.
-    """
     if not ADMIN_IP_ALLOWLIST:
         return True
     if not ip:
@@ -362,12 +325,6 @@ def _ip_allowed(ip: Optional[str]) -> bool:
 
 
 def _require_admin(request: Request) -> Optional[JSONResponse]:
-    """
-    Admin auth for /admin/* endpoints.
-    Requires BOTH:
-      - x-admin-key header matches ADMIN_KEY (Secrets Manager preferred)
-      - request.client.host is in ADMIN_IP_ALLOWLIST (if configured)
-    """
     admin_key = _get_admin_key()
     if not admin_key:
         return JSONResponse({"detail": "ADMIN_KEY not configured"}, status_code=503)
@@ -396,7 +353,7 @@ def _rate_limit_burst() -> float:
     return float(os.getenv("RATE_LIMIT_BURST", "10"))
 
 
-_local_buckets: dict[str, dict[str, float]] = {}  # {bucket_id: {"tokens":x,"last":ts}}
+_local_buckets: dict[str, dict[str, float]] = {}
 
 
 def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> bool:
@@ -424,23 +381,23 @@ def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> boo
 async def api_key_middleware(request: Request, call_next):
     endpoint = request.url.path
 
-    # Public endpoints
     if endpoint in PUBLIC_PATHS:
         return await call_next(request)
 
-    # Admin endpoints (bypass x-api-key, enforce x-admin-key + IP allowlist)
     if endpoint in ADMIN_PATHS:
         rej = _require_admin(request)
         if rej:
             return rej
         return await call_next(request)
 
-    # Normal API-key protected endpoints
     api_key = _get_api_key()
     provided = request.headers.get("x-api-key")
 
     # If API_KEY not set, allow (dev mode)
     if not api_key:
+        # (tiny hardening) still set key_hash if caller provided a key
+        if provided:
+            request.state.key_hash = _sha256_12(provided)
         return await call_next(request)
 
     if provided != api_key:
@@ -448,36 +405,22 @@ async def api_key_middleware(request: Request, call_next):
         _emit_metric("EndpointRequest", 1, endpoint=endpoint)
         return JSONResponse({"detail": "Invalid API key"}, status_code=401)
 
-    # Authenticated
     request.state.key_hash = _sha256_12(provided)
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
-    # Usage quota (daily) — plan-aware
     if endpoint in BILLABLE_PATHS:
         plan, limit = _plan_get_limit(request.state.key_hash)
-        ok = _quota_allow_request_with_limit(
-            request.state.key_hash, endpoint, daily_limit=limit, cost=1
-        )
+        ok = _quota_allow_request_with_limit(request.state.key_hash, endpoint, daily_limit=limit, cost=1)
         if not ok:
-            _emit_metric(
-                "ApiKeyQuotaExceeded",
-                1,
-                endpoint=endpoint,
-                key_hash=request.state.key_hash,
-                plan=plan,
-            )
-            return JSONResponse(
-                {"detail": "Quota exceeded", "plan": plan, "daily_limit": limit}, status_code=429
-            )
+            _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=request.state.key_hash, plan=plan)
+            return JSONResponse({"detail": "Quota exceeded", "plan": plan, "daily_limit": limit}, status_code=429)
 
-    # Global limiter (DDB)
-    if not _global_allow_request(request.state.key_hash, endpoint, cost=1.0):
+    if not _global_allow_request(request.state.key_hash, endpoint, cost=1):
         _emit_metric("RateLimitedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
         return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
     _emit_metric("RateLimitAllowedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
 
-    # Local limiter (in-memory)
     if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
         _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
         return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
@@ -539,19 +482,11 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
     _plan_cache.pop(kh, None)
     _emit_metric("AdminPlanUpsert", 1, key_hash=kh, plan=plan)
 
-    return AdminPlanResponse(
-        key_hash=kh,
-        pk=pk,
-        plan=plan,
-        daily_limit=daily_limit,
-        updated_at=updated_at,
-    )
+    return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at)
 
 
 @app.get("/admin/plan", response_model=AdminPlanResponse)
-def admin_plan_get(
-    request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None
-):
+def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None):
     kh = _resolve_key_hash(api_key, key_hash)
     if not kh:
         return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
@@ -562,17 +497,13 @@ def admin_plan_get(
     if not item:
         plan, limit = _plan_get_limit(kh)
         updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        return AdminPlanResponse(
-            key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at
-        )
+        return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at)
 
     plan = item.get("plan", {}).get("S", "pro")
     daily_limit = int(float(item.get("daily_limit", {}).get("N", str(QUOTA_DAILY_LIMIT))))
     updated_at = item.get("updated_at", {}).get("S", "")
 
-    return AdminPlanResponse(
-        key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at
-    )
+    return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at)
 
 
 # -------------------------
@@ -597,9 +528,7 @@ def usage(request: Request):
         print(f"USAGE_DDB_WARN — {e}")
 
     resets_epoch = _next_midnight_utc_epoch(extra_minutes=10)
-    resets_at = datetime.fromtimestamp(resets_epoch, tz=timezone.utc).isoformat().replace(
-        "+00:00", "Z"
-    )
+    resets_at = datetime.fromtimestamp(resets_epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
     remaining = max(0, int(limit) - int(used))
 
@@ -711,7 +640,7 @@ def _build_explain(
 
 
 def _load_price_pipeline(asset: str):
-    symbol_filter = asset.replace("-", "_")  # BTC-USD -> BTC_USD
+    symbol_filter = asset.replace("-", "_")
     try:
         price = load_price_data(symbol_filter=symbol_filter)
     except FileNotFoundError as e:
@@ -799,19 +728,19 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/__version")
+def version():
+    return {"version": app.version, "service": SERVICE_NAME}
+
+
 @app.get("/signal", response_model=SignalResponse)
-def get_signal(
-    asset: str = "BTC-USD",
-    mode: Literal["price_only", "combined"] = "combined",
-    explain: int = 0,
-):
+def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined", explain: int = 0):
     t0 = time.time()
     _emit_metric("SignalRequest", 1, asset=asset, mode=mode)
 
     try:
         ttl = _cache_ttl_seconds()
 
-        # Cache read (best effort)
         try:
             bucket = cache_bucket()
             cached = read_latest_signal(asset, mode)
@@ -848,7 +777,6 @@ def get_signal(
         _emit_metric("CacheMiss", 1, asset=asset, mode=mode)
         _emit_metric("CacheFresh", 0, unit="Count", asset=asset, mode=mode)
 
-        # Compute
         price_sig = _load_price_pipeline(asset)
         if isinstance(price_sig, JSONResponse):
             return price_sig
@@ -879,7 +807,6 @@ def get_signal(
         if explain == 1:
             resp.explain = _build_explain(asset, mode, price_sig, latest_signal, latest_sentiment)
 
-        # Cache write (best effort)
         if bucket:
             payload = {
                 "asset": resp.asset,
@@ -912,10 +839,7 @@ def get_signal(
 
 
 @app.get("/signal/explain", response_model=SignalResponse)
-def get_signal_explain(
-    asset: str = "BTC-USD",
-    mode: Literal["price_only", "combined"] = "combined",
-):
+def get_signal_explain(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined"):
     return get_signal(asset=asset, mode=mode, explain=1)
 
 
@@ -959,7 +883,7 @@ def backtest(
     mode: Literal["price_only", "combined"] = "combined",
     fee_bps: float = 10.0,
     slippage_bps: float = 5.0,
-    annualization: int = 8760,  # 1h bars default
+    annualization: int = 8760,
 ):
     t0 = time.time()
     _emit_metric("BacktestRequest", 1, asset=asset, mode=mode)
