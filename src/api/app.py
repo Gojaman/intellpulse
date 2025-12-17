@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -26,7 +27,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.9")
+app = FastAPI(title="Intellpulse API", version="0.2.10")
 
 app.add_middleware(
     CORSMiddleware,
@@ -215,7 +216,6 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
             else:
                 limit = int(PLAN_DEFAULTS.get(plan, limit))
         else:
-            # No plan row => default by plan name using PLAN_DEFAULTS on "pro"
             limit = int(PLAN_DEFAULTS.get(plan, limit))
 
         if PLAN_CACHE_SECONDS > 0:
@@ -269,34 +269,62 @@ def _quota_allow_request_with_limit(
 
 
 # -------------------------
-# API Key + Admin Key
+# API Key + Admin Key (+ Admin IP allowlist)
 # -------------------------
 PUBLIC_PATHS = {"/health"}
 ADMIN_PATHS = {"/admin/plan"}
 
-# IMPORTANT: auth still required for these, but they are non-billable and exempt from rate limiting.
-NON_BILLABLE_PATHS = {"/usage"}
-RATE_LIMIT_EXEMPT_PATHS = {"/usage"}
-
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()  # e.g. "1.2.3.4/32,5.6.7.0/24"
 
 
 def _sha256_12(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
 
+def _ip_allowed(ip: Optional[str]) -> bool:
+    """
+    If ADMIN_IP_ALLOWLIST is empty => allow (backward compatible).
+    Otherwise require the client IP to be in one of the CIDRs.
+    """
+    if not ADMIN_IP_ALLOWLIST:
+        return True
+    if not ip:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        for part in ADMIN_IP_ALLOWLIST.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            net = ipaddress.ip_network(part, strict=False)
+            if ip_obj in net:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _require_admin(request: Request) -> Optional[JSONResponse]:
     """
     Admin auth for /admin/* endpoints.
-    Uses x-admin-key header (must match env ADMIN_KEY).
+    Requires BOTH:
+      - x-admin-key header matches env ADMIN_KEY
+      - request.client.host is in ADMIN_IP_ALLOWLIST (if configured)
     """
     if not ADMIN_KEY:
         return JSONResponse({"detail": "ADMIN_KEY not configured"}, status_code=503)
+
+    client_ip = getattr(getattr(request, "client", None), "host", None)
+    if not _ip_allowed(client_ip):
+        _emit_metric("AdminIpDenied", 1, endpoint=request.url.path, ip=client_ip or "none")
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     provided = request.headers.get("x-admin-key", "")
     if provided != ADMIN_KEY:
         _emit_metric("AdminUnauthorized", 1, endpoint=request.url.path)
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
     return None
 
 
@@ -343,7 +371,7 @@ async def api_key_middleware(request: Request, call_next):
     if endpoint in PUBLIC_PATHS:
         return await call_next(request)
 
-    # Admin endpoints (bypass x-api-key, enforce x-admin-key)
+    # Admin endpoints (bypass x-api-key, enforce x-admin-key + IP allowlist)
     if endpoint in ADMIN_PATHS:
         rej = _require_admin(request)
         if rej:
@@ -368,7 +396,7 @@ async def api_key_middleware(request: Request, call_next):
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
-    # Usage quota (daily) — plan-aware (skip for non-billable endpoints like /usage)
+    # Usage quota (daily) — plan-aware
     if endpoint in BILLABLE_PATHS:
         plan, limit = _plan_get_limit(request.state.key_hash)
         ok = _quota_allow_request_with_limit(
@@ -386,18 +414,16 @@ async def api_key_middleware(request: Request, call_next):
                 {"detail": "Quota exceeded", "plan": plan, "daily_limit": limit}, status_code=429
             )
 
-    # Rate limiting (skip for exempt endpoints like /usage)
-    if endpoint not in RATE_LIMIT_EXEMPT_PATHS:
-        # Global limiter (DDB)
-        if not _global_allow_request(request.state.key_hash, endpoint, cost=1.0):
-            _emit_metric("RateLimitedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
-        _emit_metric("RateLimitAllowedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+    # Global limiter (DDB)
+    if not _global_allow_request(request.state.key_hash, endpoint, cost=1.0):
+        _emit_metric("RateLimitedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+    _emit_metric("RateLimitAllowedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
 
-        # Local limiter (in-memory)
-        if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
-            _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+    # Local limiter (in-memory)
+    if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
+        _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
 
     return await call_next(request)
 
@@ -406,15 +432,10 @@ async def api_key_middleware(request: Request, call_next):
 # Admin schemas + routes
 # -------------------------
 class AdminPlanUpsertRequest(BaseModel):
-    # Provide ONE of these:
     api_key: Optional[str] = None
     key_hash: Optional[str] = None
-
-    # What to set
     plan: str = "free"
     daily_limit: int = 200
-
-    # Optional metadata
     note: Optional[str] = None
 
 
@@ -436,7 +457,6 @@ def _resolve_key_hash(api_key: Optional[str], key_hash: Optional[str]) -> Option
 
 @app.post("/admin/plan", response_model=AdminPlanResponse)
 def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
-    # middleware already enforced x-admin-key
     kh = _resolve_key_hash(payload.api_key, payload.key_hash)
     if not kh:
         return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
@@ -449,7 +469,6 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
     pk = _plan_pk(kh)
     updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # safest: overwrite whole item; avoids UpdateExpression edge-cases
     item = {
         "pk": {"S": pk},
         "plan": {"S": plan},
@@ -460,10 +479,7 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
         item["note"] = {"S": str(payload.note)[:500]}
 
     _ddb.put_item(TableName=QUOTA_TABLE, Item=item)
-
-    # Invalidate plan cache immediately (so changes apply now)
     _plan_cache.pop(kh, None)
-
     _emit_metric("AdminPlanUpsert", 1, key_hash=kh, plan=plan)
 
     return AdminPlanResponse(
@@ -479,7 +495,6 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
 def admin_plan_get(
     request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None
 ):
-    # middleware already enforced x-admin-key
     kh = _resolve_key_hash(api_key, key_hash)
     if not kh:
         return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
@@ -508,7 +523,6 @@ def admin_plan_get(
 # -------------------------
 @app.get("/usage")
 def usage(request: Request):
-    # middleware sets request.state.key_hash for valid x-api-key
     key_hash = getattr(request.state, "key_hash", None)
     if not key_hash:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
