@@ -73,7 +73,6 @@ def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> 
 
 # -------------------------
 # Global (DynamoDB) rate limiter (fixed-window counter)
-# Robust MVP implementation: always creates items you can scan + verify.
 # -------------------------
 RATE_TABLE = os.getenv("RATE_LIMIT_TABLE", "intellpulse-rate-limit")
 GLOBAL_RATE_ENABLED = os.getenv("GLOBAL_RATE_LIMIT_ENABLED", "0") == "1"
@@ -86,7 +85,6 @@ GLOBAL_WINDOW_SECONDS = int(os.getenv("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 
 def _ddb_pk(key_hash: str, endpoint: str, window_id: int) -> str:
-    # pk must be the partition key name in your table
     return f"{key_hash}#{endpoint}#{window_id}"
 
 
@@ -127,11 +125,9 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
         return True
 
     except _ddb.exceptions.ConditionalCheckFailedException:
-        # Over limit
         return False
 
     except Exception as e:
-        # MVP: fail-open, but visible
         print(f"RATE_LIMIT_DDB_WARN — {e}")
         _emit_metric("RateLimitDdbError", 1, endpoint=endpoint, key_hash=key_hash)
         return True
@@ -164,72 +160,6 @@ def _quota_pk(key_hash: str) -> str:
     return f"quota#{key_hash}#{_utc_yyyymmdd()}"
 
 
-def _today_quota_pk(key_hash: str) -> str:
-    return f"quota#{key_hash}#{_utc_yyyymmdd()}"
-
-
-def _quota_get_used_today(key_hash: str) -> int:
-    """
-    Read-only: returns how many requests have been used today.
-    Never increments.
-    """
-    if not QUOTA_ENABLED:
-        return 0
-
-    pk = _today_quota_pk(key_hash)
-    try:
-        resp = _ddb.get_item(
-            TableName=QUOTA_TABLE,
-            Key={"pk": {"S": pk}},
-            ConsistentRead=False,
-        )
-        item = resp.get("Item") or {}
-        n = item.get("n", {}).get("N")
-        return int(float(n)) if n is not None else 0
-    except Exception as e:
-        print(f"QUOTA_DDB_WARN — {e}")
-        _emit_metric("QuotaReadError", 1, key_hash=key_hash)
-        return 0
-
-
-def _quota_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
-    """
-    Atomically increments today's counter if under limit.
-    Fail-open on DDB errors (MVP-safe).
-    """
-    if not QUOTA_ENABLED:
-        return True
-
-    pk = _quota_pk(key_hash)
-    expires_at = _next_midnight_utc_epoch(extra_minutes=10)
-
-    try:
-        # Only increment if current n < limit
-        _ddb.update_item(
-            TableName=QUOTA_TABLE,
-            Key={"pk": {"S": pk}},
-            UpdateExpression="SET #n = if_not_exists(#n, :z) + :c, expires_at = :exp",
-            ConditionExpression="attribute_not_exists(#n) OR #n < :limit",
-            ExpressionAttributeNames={"#n": "n"},
-            ExpressionAttributeValues={
-                ":z": {"N": "0"},
-                ":c": {"N": str(int(cost))},
-                ":limit": {"N": str(int(QUOTA_DAILY_LIMIT))},
-                ":exp": {"N": str(int(expires_at))},
-            },
-        )
-        return True
-
-    except _ddb.exceptions.ConditionalCheckFailedException:
-        # limit hit
-        return False
-
-    except Exception as e:
-        print(f"QUOTA_DDB_WARN — {e}")
-        _emit_metric("QuotaError", 1, endpoint=endpoint, key_hash=key_hash)
-        return True
-
-
 # -------------------------
 # Plans mapping (DynamoDB) — key_hash -> plan -> daily_limit
 # -------------------------
@@ -237,7 +167,6 @@ PLAN_ENABLED = os.getenv("PLAN_ENABLED", "1") == "1"
 PLAN_CACHE_SECONDS = int(os.getenv("PLAN_CACHE_SECONDS", "60"))  # allow 0 to disable cache
 PLAN_DEBUG = os.getenv("PLAN_DEBUG", "0") == "1"
 
-# Default limits if no plan item exists
 PLAN_DEFAULTS = {
     "free": 200,
     "pro": 2000,
@@ -256,20 +185,18 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
     Returns (plan_name, daily_limit).
 
     Cache can be disabled by setting PLAN_CACHE_SECONDS=0.
-    Fail-open to QUOTA_DAILY_LIMIT on DDB errors (MVP-safe).
+    Fail-open to QUOTA_DAILY_LIMIT on DDB errors.
     """
     if not PLAN_ENABLED:
         return ("pro", int(QUOTA_DAILY_LIMIT))
 
     now = int(time.time())
 
-    # Cache hit (only if enabled)
     if PLAN_CACHE_SECONDS > 0:
         hit = _plan_cache.get(key_hash)
         if hit and hit.get("exp", 0) > now:
             return (hit["plan"], int(hit["limit"]))
 
-    # Defaults if missing
     plan = "pro"
     limit = int(QUOTA_DAILY_LIMIT)
 
@@ -288,7 +215,6 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
             else:
                 limit = int(PLAN_DEFAULTS.get(plan, limit))
 
-        # Store cache (only if enabled)
         if PLAN_CACHE_SECONDS > 0:
             _plan_cache[key_hash] = {
                 "plan": plan,
@@ -310,9 +236,6 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
 def _quota_allow_request_with_limit(
     key_hash: str, endpoint: str, daily_limit: int, cost: int = 1
 ) -> bool:
-    """
-    Same as _quota_allow_request, but uses a dynamic daily_limit.
-    """
     if not QUOTA_ENABLED:
         return True
 
@@ -343,13 +266,33 @@ def _quota_allow_request_with_limit(
 
 
 # -------------------------
-# API Key protection
+# API Key + Admin Key
 # -------------------------
 PUBLIC_PATHS = {"/health"}
+ADMIN_PATHS = {"/admin/plan"}
+
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 
 def _sha256_12(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+
+def _require_admin(request: Request) -> Optional[JSONResponse]:
+    """
+    Admin auth for /admin/* endpoints.
+    Uses x-admin-key header (must match env ADMIN_KEY).
+    """
+    if not ADMIN_KEY:
+        return JSONResponse(
+            {"detail": "ADMIN_KEY not configured"}, status_code=503
+        )
+
+    provided = request.headers.get("x-admin-key", "")
+    if provided != ADMIN_KEY:
+        _emit_metric("AdminUnauthorized", 1, endpoint=request.url.path)
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return None
 
 
 # -------------------------
@@ -391,9 +334,18 @@ def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> boo
 async def api_key_middleware(request: Request, call_next):
     endpoint = request.url.path
 
+    # Public endpoints
     if endpoint in PUBLIC_PATHS:
         return await call_next(request)
 
+    # Admin endpoints (bypass x-api-key, enforce x-admin-key)
+    if endpoint in ADMIN_PATHS:
+        rej = _require_admin(request)
+        if rej:
+            return rej
+        return await call_next(request)
+
+    # Normal API-key protected endpoints
     api_key = os.getenv("API_KEY")
     provided = request.headers.get("x-api-key")
 
@@ -441,6 +393,118 @@ async def api_key_middleware(request: Request, call_next):
         return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
 
     return await call_next(request)
+
+
+# -------------------------
+# Admin schemas + routes
+# -------------------------
+class AdminPlanUpsertRequest(BaseModel):
+    # Provide ONE of these:
+    api_key: Optional[str] = None
+    key_hash: Optional[str] = None
+
+    # What to set
+    plan: str = "free"
+    daily_limit: int = 200
+
+    # Optional metadata
+    note: Optional[str] = None
+
+
+class AdminPlanResponse(BaseModel):
+    key_hash: str
+    pk: str
+    plan: str
+    daily_limit: int
+    updated_at: str
+
+
+def _resolve_key_hash(api_key: Optional[str], key_hash: Optional[str]) -> Optional[str]:
+    if api_key:
+        return _sha256_12(api_key)
+    if key_hash:
+        return key_hash.strip()
+    return None
+
+
+@app.post("/admin/plan", response_model=AdminPlanResponse)
+def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
+    # middleware already enforced x-admin-key
+    kh = _resolve_key_hash(payload.api_key, payload.key_hash)
+    if not kh:
+        return JSONResponse(
+            {"detail": "Provide api_key or key_hash"}, status_code=400
+        )
+
+    plan = (payload.plan or "free").strip().lower()
+    daily_limit = int(payload.daily_limit)
+
+    if daily_limit < 1:
+        return JSONResponse({"detail": "daily_limit must be >= 1"}, status_code=400)
+
+    pk = _plan_pk(kh)
+    updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    item = {
+        "pk": {"S": pk},
+        "plan": {"S": plan},
+        "daily_limit": {"N": str(daily_limit)},
+        "updated_at": {"S": updated_at},
+    }
+    if payload.note:
+        item["note"] = {"S": str(payload.note)[:500]}
+
+    _ddb.put_item(TableName=QUOTA_TABLE, Item=item)
+
+    # Invalidate plan cache immediately (so changes apply now)
+    _plan_cache.pop(kh, None)
+
+    _emit_metric("AdminPlanUpsert", 1, key_hash=kh, plan=plan)
+
+    return AdminPlanResponse(
+        key_hash=kh,
+        pk=pk,
+        plan=plan,
+        daily_limit=daily_limit,
+        updated_at=updated_at,
+    )
+
+
+@app.get("/admin/plan", response_model=AdminPlanResponse)
+def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None):
+    # middleware already enforced x-admin-key
+    kh = _resolve_key_hash(api_key, key_hash)
+    if not kh:
+        return JSONResponse(
+            {"detail": "Provide api_key or key_hash"}, status_code=400
+        )
+
+    pk = _plan_pk(kh)
+    resp = _ddb.get_item(TableName=QUOTA_TABLE, Key={"pk": {"S": pk}}, ConsistentRead=False)
+    item = resp.get("Item")
+    if not item:
+        # If no explicit plan, return your effective defaults (pro/QUOTA_DAILY_LIMIT)
+        plan, limit = _plan_get_limit(kh)
+        updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return AdminPlanResponse(
+            key_hash=kh,
+            pk=pk,
+            plan=plan,
+            daily_limit=int(limit),
+            updated_at=updated_at,
+        )
+
+    plan = item.get("plan", {}).get("S", "pro")
+    daily_limit = int(float(item.get("daily_limit", {}).get("N", str(QUOTA_DAILY_LIMIT))))
+    updated_at = item.get("updated_at", {}).get("S", "")
+
+    return AdminPlanResponse(
+        key_hash=kh,
+        pk=pk,
+        plan=plan,
+        daily_limit=daily_limit,
+        updated_at=updated_at,
+    )
 
 
 # -------------------------
@@ -539,10 +603,6 @@ def _build_explain(
 
 
 def _load_price_pipeline(asset: str):
-    """
-    Load price data using the correct loader signature.
-    If missing, return 404 (never 500).
-    """
     symbol_filter = asset.replace("-", "_")  # BTC-USD -> BTC_USD
     try:
         price = load_price_data(symbol_filter=symbol_filter)
@@ -550,9 +610,7 @@ def _load_price_pipeline(asset: str):
         _emit_metric("PriceDataMissing", 1, asset=asset)
         return JSONResponse(
             status_code=404,
-            content={
-                "detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"
-            },
+            content={"detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"},
         )
 
     feat = build_price_feature_set(price)
@@ -631,35 +689,6 @@ class BacktestResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/usage")
-def usage(request: Request):
-    key_hash = getattr(request.state, "key_hash", None)
-    if not key_hash:
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-
-    plan, limit = _plan_get_limit(key_hash)
-    used = _quota_get_used_today(key_hash)
-    remaining = max(0, int(limit) - int(used))
-
-    resets_at_epoch = _next_midnight_utc_epoch(extra_minutes=10)
-    resets_at_iso = (
-        datetime.fromtimestamp(resets_at_epoch, tz=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-
-    return {
-        "plan": plan,
-        "daily_limit": int(limit),
-        "used_today": int(used),
-        "remaining": int(remaining),
-        "resets_at": resets_at_iso,
-        "resets_at_epoch": int(resets_at_epoch),
-        "quota_pk": _today_quota_pk(key_hash),
-        "date_utc": _utc_yyyymmdd(),
-    }
 
 
 @app.get("/signal", response_model=SignalResponse)
@@ -771,9 +800,7 @@ def get_signal(
     except Exception as e:
         reason = e.__class__.__name__
         _emit_metric("SignalError", 1, asset=asset, mode=mode, reason=reason)
-        return JSONResponse(
-            status_code=503, content={"detail": "Data unavailable for asset " + asset}
-        )
+        return JSONResponse(status_code=503, content={"detail": "Data unavailable for asset " + asset})
 
 
 @app.get("/signal/explain", response_model=SignalResponse)
@@ -845,14 +872,11 @@ def backtest(
         if "close" not in df.columns or signal_col not in df.columns:
             raise ValueError("missing required columns")
 
-        # returns
         ret = df["close"].pct_change().fillna(0.0)
 
-        # position: enter on next bar to avoid lookahead
         sig = df[signal_col].fillna(0).astype(float).clip(-1, 1)
         pos = sig.shift(1).fillna(0.0)
 
-        # trading cost per position change
         cost_rate = (float(fee_bps) + float(slippage_bps)) / 10000.0
         pos_prev = pos.shift(1).fillna(0.0)
         trade = (pos != pos_prev).astype(float)
@@ -869,23 +893,19 @@ def backtest(
         )
         mdd = _max_drawdown(equity)
 
-        # trades + win rate
         trade_idx = df.index[trade == 1.0]
         trades = int(len(trade_idx))
 
-        # crude win rate: per-bar PnL positive while in position
         wins = int((strat_ret > 0).sum())
         win_rate = float(wins / max(1, int((pos != 0).sum())))
 
-        # buy & hold
-        bh_ret = ret
-        bh_equity = (1.0 + bh_ret).cumprod()
+        bh_equity = (1.0 + ret).cumprod()
         bh_total = float(bh_equity.iloc[-1] - 1.0)
         bh_mdd = _max_drawdown(bh_equity)
         bh_end = float(bh_equity.iloc[-1])
 
         pts = []
-        tail = equity.tail(200)  # keep response light
+        tail = equity.tail(200)
         for ts, v in tail.items():
             pts.append(BacktestPoint(t=ts.isoformat(), equity=float(v)))
 
@@ -923,9 +943,7 @@ def backtest(
     except Exception as e:
         reason = e.__class__.__name__
         _emit_metric("BacktestError", 1, asset=asset, mode=mode, reason=reason)
-        return JSONResponse(
-            status_code=503, content={"detail": "Backtest unavailable for asset " + asset}
-        )
+        return JSONResponse(status_code=503, content={"detail": "Backtest unavailable for asset " + asset})
 
 
 handler = Mangum(app)
