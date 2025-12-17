@@ -1,0 +1,14 @@
+{
+  "Variables": {
+    "SIGNALS_BUCKET": "intellpulse-signals-528757798791-us-east-1",
+    "RATE_LIMIT_TABLE": "intellpulse-rate-limit",
+    "API_KEY": "REPLACE_ME_API_KEY",
+    "SIGNAL_CACHE_TTL_SECONDS": "900",
+    "GLOBAL_RATE_LIMIT_ENABLED": "1",
+    "GLOBAL_RATE_LIMIT_RPS": "3",
+    "GLOBAL_RATE_LIMIT_BURST": "10",
+    "QUOTA_ENABLED": "1",
+    "QUOTA_TABLE": "intellpulse-rate-limit",
+    "QUOTA_DAILY_LIMIT": "2000"
+  }
+}
