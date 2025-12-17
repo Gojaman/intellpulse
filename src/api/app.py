@@ -77,19 +77,22 @@ def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> 
 # -------------------------
 RATE_TABLE = os.getenv("RATE_LIMIT_TABLE", "intellpulse-rate-limit")
 GLOBAL_RATE_ENABLED = os.getenv("GLOBAL_RATE_LIMIT_ENABLED", "0") == "1"
-GLOBAL_RPS = float(os.getenv("GLOBAL_RATE_LIMIT_RPS", "3"))      # sustained
-GLOBAL_BURST = float(os.getenv("GLOBAL_RATE_LIMIT_BURST", "10")) # extra headroom
+GLOBAL_RPS = float(os.getenv("GLOBAL_RATE_LIMIT_RPS", "3"))  # sustained
+GLOBAL_BURST = float(os.getenv("GLOBAL_RATE_LIMIT_BURST", "10"))  # extra headroom
 GLOBAL_TTL_SECONDS = int(os.getenv("GLOBAL_RATE_LIMIT_TTL_SECONDS", "3600"))
 
 # Window length in seconds (60 = per-minute quotas; easiest to validate)
 GLOBAL_WINDOW_SECONDS = int(os.getenv("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
+
 def _ddb_pk(key_hash: str, endpoint: str, window_id: int) -> str:
     # pk must be the partition key name in your table
     return f"{key_hash}#{endpoint}#{window_id}"
 
+
 def _epoch_s() -> int:
     return int(time.time())
+
 
 def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
     """
@@ -144,16 +147,22 @@ QUOTA_DAILY_LIMIT = int(os.getenv("QUOTA_DAILY_LIMIT", "2000"))
 # Endpoints that count against daily quota
 BILLABLE_PATHS = {"/signal", "/signal/explain", "/backtest"}
 
+
 def _utc_yyyymmdd() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
 
+
 def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
     now = datetime.now(timezone.utc)
-    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(
+        days=1
+    )
     return int((tomorrow_midnight + timedelta(minutes=extra_minutes)).timestamp())
+
 
 def _quota_pk(key_hash: str) -> str:
     return f"quota#{key_hash}#{_utc_yyyymmdd()}"
+
 
 def _quota_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
     """
@@ -187,6 +196,118 @@ def _quota_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
         # limit hit
         return False
 
+    except Exception as e:
+        print(f"QUOTA_DDB_WARN — {e}")
+        _emit_metric("QuotaError", 1, endpoint=endpoint, key_hash=key_hash)
+        return True
+
+
+# -------------------------
+# Plans mapping (DynamoDB) — key_hash -> plan -> daily_limit
+# -------------------------
+PLAN_ENABLED = os.getenv("PLAN_ENABLED", "1") == "1"
+PLAN_CACHE_SECONDS = int(os.getenv("PLAN_CACHE_SECONDS", "60"))  # allow 0 to disable cache
+PLAN_DEBUG = os.getenv("PLAN_DEBUG", "0") == "1"
+
+# Default limits if no plan item exists
+PLAN_DEFAULTS = {
+    "free": 200,
+    "pro": 2000,
+    "enterprise": 10000,
+}
+
+_plan_cache: dict[str, dict] = {}  # key_hash -> {"limit": int, "plan": str, "exp": epoch}
+
+
+def _plan_pk(key_hash: str) -> str:
+    return f"plan#{key_hash}"
+
+
+def _plan_get_limit(key_hash: str) -> tuple[str, int]:
+    """
+    Returns (plan_name, daily_limit).
+
+    Cache can be disabled by setting PLAN_CACHE_SECONDS=0.
+    Fail-open to QUOTA_DAILY_LIMIT on DDB errors (MVP-safe).
+    """
+    if not PLAN_ENABLED:
+        return ("pro", int(QUOTA_DAILY_LIMIT))
+
+    now = int(time.time())
+
+    # Cache hit (only if enabled)
+    if PLAN_CACHE_SECONDS > 0:
+        hit = _plan_cache.get(key_hash)
+        if hit and hit.get("exp", 0) > now:
+            return (hit["plan"], int(hit["limit"]))
+
+    # Defaults if missing
+    plan = "pro"
+    limit = int(QUOTA_DAILY_LIMIT)
+
+    try:
+        resp = _ddb.get_item(
+            TableName=QUOTA_TABLE,
+            Key={"pk": {"S": _plan_pk(key_hash)}},
+            ConsistentRead=False,
+        )
+        item = resp.get("Item")
+        if item:
+            if "plan" in item and "S" in item["plan"]:
+                plan = item["plan"]["S"]
+            if "daily_limit" in item and "N" in item["daily_limit"]:
+                limit = int(float(item["daily_limit"]["N"]))
+            else:
+                limit = int(PLAN_DEFAULTS.get(plan, limit))
+
+        # Store cache (only if enabled)
+        if PLAN_CACHE_SECONDS > 0:
+            _plan_cache[key_hash] = {
+                "plan": plan,
+                "limit": limit,
+                "exp": now + PLAN_CACHE_SECONDS,
+            }
+
+        if PLAN_DEBUG:
+            print(f"PLAN_DEBUG key_hash={key_hash} plan={plan} limit={limit}")
+
+        return (plan, limit)
+
+    except Exception as e:
+        print(f"PLAN_DDB_WARN — {e}")
+        _emit_metric("PlanLookupError", 1, key_hash=key_hash)
+        return ("pro", int(QUOTA_DAILY_LIMIT))
+
+
+def _quota_allow_request_with_limit(
+    key_hash: str, endpoint: str, daily_limit: int, cost: int = 1
+) -> bool:
+    """
+    Same as _quota_allow_request, but uses a dynamic daily_limit.
+    """
+    if not QUOTA_ENABLED:
+        return True
+
+    pk = _quota_pk(key_hash)
+    expires_at = _next_midnight_utc_epoch(extra_minutes=10)
+
+    try:
+        _ddb.update_item(
+            TableName=QUOTA_TABLE,
+            Key={"pk": {"S": pk}},
+            UpdateExpression="SET #n = if_not_exists(#n, :z) + :c, expires_at = :exp",
+            ConditionExpression="attribute_not_exists(#n) OR #n < :limit",
+            ExpressionAttributeNames={"#n": "n"},
+            ExpressionAttributeValues={
+                ":z": {"N": "0"},
+                ":c": {"N": str(int(cost))},
+                ":limit": {"N": str(int(daily_limit))},
+                ":exp": {"N": str(int(expires_at))},
+            },
+        )
+        return True
+    except _ddb.exceptions.ConditionalCheckFailedException:
+        return False
     except Exception as e:
         print(f"QUOTA_DDB_WARN — {e}")
         _emit_metric("QuotaError", 1, endpoint=endpoint, key_hash=key_hash)
@@ -262,12 +383,23 @@ async def api_key_middleware(request: Request, call_next):
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
-    # Usage quota (daily) — do this early for billable endpoints
+    # Usage quota (daily) — plan-aware
     if endpoint in BILLABLE_PATHS:
-        ok = _quota_allow_request(request.state.key_hash, endpoint, cost=1)
+        plan, limit = _plan_get_limit(request.state.key_hash)
+        ok = _quota_allow_request_with_limit(
+            request.state.key_hash, endpoint, daily_limit=limit, cost=1
+        )
         if not ok:
-            _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-            return JSONResponse({"detail": "Quota exceeded"}, status_code=429)
+            _emit_metric(
+                "ApiKeyQuotaExceeded",
+                1,
+                endpoint=endpoint,
+                key_hash=request.state.key_hash,
+                plan=plan,
+            )
+            return JSONResponse(
+                {"detail": "Quota exceeded", "plan": plan, "daily_limit": limit}, status_code=429
+            )
 
     # Global limiter (DDB)
     if not _global_allow_request(request.state.key_hash, endpoint, cost=1.0):
@@ -390,7 +522,9 @@ def _load_price_pipeline(asset: str):
         _emit_metric("PriceDataMissing", 1, asset=asset)
         return JSONResponse(
             status_code=404,
-            content={"detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"},
+            content={
+                "detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"
+            },
         )
 
     feat = build_price_feature_set(price)
@@ -580,7 +714,9 @@ def get_signal(
     except Exception as e:
         reason = e.__class__.__name__
         _emit_metric("SignalError", 1, asset=asset, mode=mode, reason=reason)
-        return JSONResponse(status_code=503, content={"detail": "Data unavailable for asset " + asset})
+        return JSONResponse(
+            status_code=503, content={"detail": "Data unavailable for asset " + asset}
+        )
 
 
 @app.get("/signal/explain", response_model=SignalResponse)
@@ -730,7 +866,9 @@ def backtest(
     except Exception as e:
         reason = e.__class__.__name__
         _emit_metric("BacktestError", 1, asset=asset, mode=mode, reason=reason)
-        return JSONResponse(status_code=503, content={"detail": "Backtest unavailable for asset " + asset})
+        return JSONResponse(
+            status_code=503, content={"detail": "Backtest unavailable for asset " + asset}
+        )
 
 
 handler = Mangum(app)
