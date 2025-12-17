@@ -84,30 +84,48 @@ ADMIN_KEY_SECRET_ARN = os.getenv("ADMIN_KEY_SECRET_ARN", "").strip()
 
 @lru_cache(maxsize=32)
 def _get_secret_string(secret_id: str) -> str:
+    """
+    Fetches a secret from AWS Secrets Manager.
+    Supports:
+      - raw SecretString (e.g. "abc123")
+      - JSON SecretString like {"value":"abc123"} / {"key":"abc123"} / {"secret":"abc123"}
+    Cached in-process via lru_cache to avoid calling Secrets Manager on every request.
+    """
     if not secret_id:
         return ""
     try:
         resp = _sm.get_secret_value(SecretId=secret_id)
         s = resp.get("SecretString") or ""
-        # Support raw string OR {"value": "..."} JSON
+
         if s and s.strip().startswith("{"):
             try:
                 obj = json.loads(s)
                 if isinstance(obj, dict):
-                    return str(obj.get("value") or obj.get("secret") or obj.get("key") or s)
+                    # Common keys
+                    return str(
+                        obj.get("value")
+                        or obj.get("secret")
+                        or obj.get("key")
+                        or obj.get("token")
+                        or s
+                    )
             except Exception:
                 pass
+
         return s
     except Exception as e:
         print(f"SECRETS_WARN — {e}")
+        _emit_metric("SecretsError", 1, secret_id=secret_id[:32])
         return ""
 
 
 def _get_api_key() -> str:
+    # Prefer Secrets Manager; fallback to env for dev
     return _get_secret_string(API_KEY_SECRET_ARN) or os.getenv("API_KEY", "")
 
 
 def _get_admin_key() -> str:
+    # Prefer Secrets Manager; fallback to env for dev
     return _get_secret_string(ADMIN_KEY_SECRET_ARN) or os.getenv("ADMIN_KEY", "")
 
 
@@ -313,11 +331,11 @@ def _quota_allow_request_with_limit(
 PUBLIC_PATHS = {"/health"}
 ADMIN_PATHS = {"/admin/plan"}
 
-ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()  # e.g. "1.2.3.4/32,5.6.7.0/24"
+ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()  # "1.2.3.4/32,5.6.7.0/24"
 
 
 def _sha256_12(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12
 
 
 def _ip_allowed(ip: Optional[str]) -> bool:
