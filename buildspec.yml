@@ -41,16 +41,14 @@ phases:
       - "aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\" || (aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" && aws lambda update-function-code --function-name \"$STG_FN\" --region \"$AWS_REGION\" --image-uri \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST\")"
       - "aws lambda wait function-updated --function-name \"$STG_FN\" --region \"$AWS_REGION\" || true"
 
-      - "echo \"Staging smoke test: /signal (authenticated)\""
-      - "RESP=$(curl -fsS -H \"x-api-key: $API_KEY\" \"${STG_URL%/}/signal?asset=BTC-USD&mode=combined\")"
-      - "echo \"$RESP\" | grep -q '\"latest_signal_text\"'"
-      - "echo \"$RESP\" | grep -q '\"asset\":\"BTC-USD\"'"
-      - "echo \"Staging /signal OK\""
+      # ✅ Non-billable smoke tests (won't consume quota / won't 429 due to quota)
+      - "echo \"Staging smoke test: /health (public)\""
+      - "curl -fsS \"${STG_URL%/}/health\" | grep -q '\"status\"'"
 
-      - "echo \"Staging smoke test: /debug/cache/read (authenticated)\""
+      - "echo \"Staging smoke test: /debug/cache/read (authenticated, non-billable)\""
       - "RESP2=$(curl -fsS -H \"x-api-key: $API_KEY\" \"${STG_URL%/}/debug/cache/read?asset=BTC-USD&mode=combined\")"
       - "echo \"$RESP2\" | grep -q '\"enabled\"'"
-      - "echo \"Staging /debug/cache/read OK\""
+      - "echo \"Staging smoke tests OK\""
 
       - "echo \"Deploying to PROD: $PROD_FN\""
       - "aws lambda wait function-updated --function-name \"$PROD_FN\" --region \"$AWS_REGION\" || true"
