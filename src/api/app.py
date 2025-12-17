@@ -26,7 +26,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.7")
+app = FastAPI(title="Intellpulse API", version="0.2.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -214,6 +214,9 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
                 limit = int(float(item["daily_limit"]["N"]))
             else:
                 limit = int(PLAN_DEFAULTS.get(plan, limit))
+        else:
+            # No plan row => default by plan name using PLAN_DEFAULTS on "pro"
+            limit = int(PLAN_DEFAULTS.get(plan, limit))
 
         if PLAN_CACHE_SECONDS > 0:
             _plan_cache[key_hash] = {
@@ -284,9 +287,7 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
     Uses x-admin-key header (must match env ADMIN_KEY).
     """
     if not ADMIN_KEY:
-        return JSONResponse(
-            {"detail": "ADMIN_KEY not configured"}, status_code=503
-        )
+        return JSONResponse({"detail": "ADMIN_KEY not configured"}, status_code=503)
 
     provided = request.headers.get("x-admin-key", "")
     if provided != ADMIN_KEY:
@@ -432,19 +433,17 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
     # middleware already enforced x-admin-key
     kh = _resolve_key_hash(payload.api_key, payload.key_hash)
     if not kh:
-        return JSONResponse(
-            {"detail": "Provide api_key or key_hash"}, status_code=400
-        )
+        return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
 
     plan = (payload.plan or "free").strip().lower()
     daily_limit = int(payload.daily_limit)
-
     if daily_limit < 1:
         return JSONResponse({"detail": "daily_limit must be >= 1"}, status_code=400)
 
     pk = _plan_pk(kh)
     updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+    # safest: overwrite whole item; avoids UpdateExpression edge-cases
     item = {
         "pk": {"S": pk},
         "plan": {"S": plan},
@@ -471,27 +470,22 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
 
 
 @app.get("/admin/plan", response_model=AdminPlanResponse)
-def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None):
+def admin_plan_get(
+    request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None
+):
     # middleware already enforced x-admin-key
     kh = _resolve_key_hash(api_key, key_hash)
     if not kh:
-        return JSONResponse(
-            {"detail": "Provide api_key or key_hash"}, status_code=400
-        )
+        return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
 
     pk = _plan_pk(kh)
     resp = _ddb.get_item(TableName=QUOTA_TABLE, Key={"pk": {"S": pk}}, ConsistentRead=False)
     item = resp.get("Item")
     if not item:
-        # If no explicit plan, return your effective defaults (pro/QUOTA_DAILY_LIMIT)
         plan, limit = _plan_get_limit(kh)
         updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         return AdminPlanResponse(
-            key_hash=kh,
-            pk=pk,
-            plan=plan,
-            daily_limit=int(limit),
-            updated_at=updated_at,
+            key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at
         )
 
     plan = item.get("plan", {}).get("S", "pro")
@@ -499,12 +493,49 @@ def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Op
     updated_at = item.get("updated_at", {}).get("S", "")
 
     return AdminPlanResponse(
-        key_hash=kh,
-        pk=pk,
-        plan=plan,
-        daily_limit=daily_limit,
-        updated_at=updated_at,
+        key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at
     )
+
+
+# -------------------------
+# Usage endpoint (non-billable)
+# -------------------------
+@app.get("/usage")
+def usage(request: Request):
+    # middleware sets request.state.key_hash for valid x-api-key
+    key_hash = getattr(request.state, "key_hash", None)
+    if not key_hash:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    plan, limit = _plan_get_limit(key_hash)
+    pk = _quota_pk(key_hash)
+
+    used = 0
+    try:
+        resp = _ddb.get_item(TableName=QUOTA_TABLE, Key={"pk": {"S": pk}}, ConsistentRead=False)
+        item = resp.get("Item")
+        if item and "n" in item and "N" in item["n"]:
+            used = int(float(item["n"]["N"]))
+    except Exception as e:
+        print(f"USAGE_DDB_WARN — {e}")
+
+    resets_epoch = _next_midnight_utc_epoch(extra_minutes=10)
+    resets_at = datetime.fromtimestamp(resets_epoch, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+    remaining = max(0, int(limit) - int(used))
+
+    return {
+        "plan": plan,
+        "daily_limit": int(limit),
+        "used_today": int(used),
+        "remaining": int(remaining),
+        "resets_at": resets_at,
+        "resets_at_epoch": int(resets_epoch),
+        "quota_pk": pk,
+        "date_utc": _utc_yyyymmdd(),
+    }
 
 
 # -------------------------
