@@ -26,7 +26,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.6")
+app = FastAPI(title="Intellpulse API", version="0.2.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -162,6 +162,34 @@ def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
 
 def _quota_pk(key_hash: str) -> str:
     return f"quota#{key_hash}#{_utc_yyyymmdd()}"
+
+
+def _today_quota_pk(key_hash: str) -> str:
+    return f"quota#{key_hash}#{_utc_yyyymmdd()}"
+
+
+def _quota_get_used_today(key_hash: str) -> int:
+    """
+    Read-only: returns how many requests have been used today.
+    Never increments.
+    """
+    if not QUOTA_ENABLED:
+        return 0
+
+    pk = _today_quota_pk(key_hash)
+    try:
+        resp = _ddb.get_item(
+            TableName=QUOTA_TABLE,
+            Key={"pk": {"S": pk}},
+            ConsistentRead=False,
+        )
+        item = resp.get("Item") or {}
+        n = item.get("n", {}).get("N")
+        return int(float(n)) if n is not None else 0
+    except Exception as e:
+        print(f"QUOTA_DDB_WARN — {e}")
+        _emit_metric("QuotaReadError", 1, key_hash=key_hash)
+        return 0
 
 
 def _quota_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
@@ -603,6 +631,35 @@ class BacktestResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/usage")
+def usage(request: Request):
+    key_hash = getattr(request.state, "key_hash", None)
+    if not key_hash:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    plan, limit = _plan_get_limit(key_hash)
+    used = _quota_get_used_today(key_hash)
+    remaining = max(0, int(limit) - int(used))
+
+    resets_at_epoch = _next_midnight_utc_epoch(extra_minutes=10)
+    resets_at_iso = (
+        datetime.fromtimestamp(resets_at_epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    return {
+        "plan": plan,
+        "daily_limit": int(limit),
+        "used_today": int(used),
+        "remaining": int(remaining),
+        "resets_at": resets_at_iso,
+        "resets_at_epoch": int(resets_at_epoch),
+        "quota_pk": _today_quota_pk(key_hash),
+        "date_utc": _utc_yyyymmdd(),
+    }
 
 
 @app.get("/signal", response_model=SignalResponse)
