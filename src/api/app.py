@@ -26,7 +26,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.8")
+app = FastAPI(title="Intellpulse API", version="0.2.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -274,6 +274,10 @@ def _quota_allow_request_with_limit(
 PUBLIC_PATHS = {"/health"}
 ADMIN_PATHS = {"/admin/plan"}
 
+# IMPORTANT: auth still required for these, but they are non-billable and exempt from rate limiting.
+NON_BILLABLE_PATHS = {"/usage"}
+RATE_LIMIT_EXEMPT_PATHS = {"/usage"}
+
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 
@@ -364,7 +368,7 @@ async def api_key_middleware(request: Request, call_next):
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
-    # Usage quota (daily) — plan-aware
+    # Usage quota (daily) — plan-aware (skip for non-billable endpoints like /usage)
     if endpoint in BILLABLE_PATHS:
         plan, limit = _plan_get_limit(request.state.key_hash)
         ok = _quota_allow_request_with_limit(
@@ -382,16 +386,18 @@ async def api_key_middleware(request: Request, call_next):
                 {"detail": "Quota exceeded", "plan": plan, "daily_limit": limit}, status_code=429
             )
 
-    # Global limiter (DDB)
-    if not _global_allow_request(request.state.key_hash, endpoint, cost=1.0):
-        _emit_metric("RateLimitedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
-    _emit_metric("RateLimitAllowedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+    # Rate limiting (skip for exempt endpoints like /usage)
+    if endpoint not in RATE_LIMIT_EXEMPT_PATHS:
+        # Global limiter (DDB)
+        if not _global_allow_request(request.state.key_hash, endpoint, cost=1.0):
+            _emit_metric("RateLimitedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+        _emit_metric("RateLimitAllowedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
 
-    # Local limiter (in-memory)
-    if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
-        _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+        # Local limiter (in-memory)
+        if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
+            _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
+            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
 
     return await call_next(request)
 
