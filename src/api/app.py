@@ -8,7 +8,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 import boto3
 import httpx
@@ -29,7 +29,7 @@ from src.utils.s3_store import (
     write_latest_signal,
 )
 
-app = FastAPI(title="Intellpulse API", version="0.2.11")
+app = FastAPI(title="Intellpulse API", version="0.2.10")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +47,10 @@ _ddb = boto3.client("dynamodb")
 _sm = boto3.client("secretsmanager")
 
 METRICS_NS = os.getenv("METRICS_NAMESPACE", "Intellpulse/MVP1")
-SERVICE_NAME = os.getenv("SERVICE_NAME", os.getenv("AWS_LAMBDA_FUNCTION_NAME", "intellpulse-api"))
+SERVICE_NAME = os.getenv(
+    "SERVICE_NAME",
+    os.getenv("AWS_LAMBDA_FUNCTION_NAME", "intellpulse-api"),
+)
 
 
 def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> None:
@@ -124,41 +127,43 @@ def _get_admin_key() -> str:
 
 
 # -------------------------
-# Helpers
+# Dynamic config getters (IMPORTANT for warm Lambda envs)
 # -------------------------
-def _sha256_12(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+def _rate_table() -> str:
+    return os.getenv("RATE_LIMIT_TABLE", "intellpulse-rate-limit")
 
 
-def _epoch_s() -> int:
-    return int(time.time())
+def _quota_enabled() -> bool:
+    return os.getenv("QUOTA_ENABLED", "0") == "1"
 
 
-# -------------------------
-# Dynamic env reads (IMPORTANT)
-# -------------------------
-def _rate_env() -> dict:
-    # read on every request so "aws lambda update-function-configuration" takes effect immediately
-    return {
-        "RATE_TABLE": os.getenv("RATE_LIMIT_TABLE", "intellpulse-rate-limit"),
-        "GLOBAL_RATE_ENABLED": os.getenv("GLOBAL_RATE_LIMIT_ENABLED", "0") == "1",
-        "GLOBAL_RPS": float(os.getenv("GLOBAL_RATE_LIMIT_RPS", "3")),
-        "GLOBAL_BURST": float(os.getenv("GLOBAL_RATE_LIMIT_BURST", "10")),
-        "GLOBAL_TTL_SECONDS": int(os.getenv("GLOBAL_RATE_LIMIT_TTL_SECONDS", "3600")),
-        "GLOBAL_WINDOW_SECONDS": int(os.getenv("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60")),
-    }
+def _quota_table() -> str:
+    # default reuse rate table
+    return os.getenv("QUOTA_TABLE", _rate_table())
 
 
-def _quota_env() -> dict:
-    rate_table = os.getenv("RATE_LIMIT_TABLE", "intellpulse-rate-limit")
-    return {
-        "QUOTA_ENABLED": os.getenv("QUOTA_ENABLED", "0") == "1",
-        "QUOTA_TABLE": os.getenv("QUOTA_TABLE", rate_table),
-        "QUOTA_DAILY_LIMIT": int(os.getenv("QUOTA_DAILY_LIMIT", "2000")),
-        "PLAN_ENABLED": os.getenv("PLAN_ENABLED", "1") == "1",
-        "PLAN_CACHE_SECONDS": int(os.getenv("PLAN_CACHE_SECONDS", "60")),
-        "PLAN_DEBUG": os.getenv("PLAN_DEBUG", "0") == "1",
-    }
+def _quota_daily_limit_default() -> int:
+    return int(os.getenv("QUOTA_DAILY_LIMIT", "2000"))
+
+
+def _global_rate_enabled() -> bool:
+    return os.getenv("GLOBAL_RATE_LIMIT_ENABLED", "0") == "1"
+
+
+def _global_rps() -> float:
+    return float(os.getenv("GLOBAL_RATE_LIMIT_RPS", "3"))
+
+
+def _global_burst() -> float:
+    return float(os.getenv("GLOBAL_RATE_LIMIT_BURST", "10"))
+
+
+def _global_ttl_seconds() -> int:
+    return int(os.getenv("GLOBAL_RATE_LIMIT_TTL_SECONDS", "3600"))
+
+
+def _global_window_seconds() -> int:
+    return int(os.getenv("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 
 # -------------------------
@@ -168,44 +173,70 @@ def _ddb_pk(key_hash: str, endpoint: str, window_id: int) -> str:
     return f"{key_hash}#{endpoint}#{window_id}"
 
 
+def _epoch_s() -> int:
+    return int(time.time())
+
+
 def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
-    env = _rate_env()
-    if not env["GLOBAL_RATE_ENABLED"]:
+    if not _global_rate_enabled():
         return True
 
     now = _epoch_s()
-    window = max(1, int(env["GLOBAL_WINDOW_SECONDS"]))
+    window = max(1, int(_global_window_seconds()))
     window_id = now // window
     pk = _ddb_pk(key_hash, endpoint, window_id)
 
-    limit = int(max(0.01, float(env["GLOBAL_RPS"])) * window + max(0.0, float(env["GLOBAL_BURST"])))
-    limit = max(1, limit)
-    expires_at = now + max(60, int(env["GLOBAL_TTL_SECONDS"]))
+    rps = max(0.0, float(_global_rps()))
+    burst = max(0.0, float(_global_burst()))
+    limit = int(max(1.0, rps) * window + burst)
+
+    expires_at = now + max(60, int(_global_ttl_seconds()))
+    table = _rate_table()
+
+    print(
+        "RATE_LIMIT_DEBUG "
+        + json.dumps(
+            {
+                "enabled": 1,
+                "table": table,
+                "endpoint": endpoint,
+                "key_hash": key_hash,
+                "window": window,
+                "window_id": window_id,
+                "pk": pk,
+                "limit": limit,
+                "cost": int(cost),
+                "expires_at": expires_at,
+            }
+        )
+    )
 
     try:
-        # DEBUG: confirm this code path is executing
-        print(f"RL_DEBUG update_item table={env['RATE_TABLE']} pk={pk} limit={limit} window={window}")
-
-        _ddb.update_item(
-            TableName=env["RATE_TABLE"],
+        resp = _ddb.update_item(
+            TableName=table,
             Key={"pk": {"S": pk}},
-            UpdateExpression="SET expires_at = :exp ADD n :inc",
-            ConditionExpression="attribute_not_exists(n) OR n < :limit",
+            UpdateExpression="SET expires_at = :exp ADD #n :inc",
+            ConditionExpression="attribute_not_exists(#n) OR #n < :limit",
+            ExpressionAttributeNames={"#n": "n"},
             ExpressionAttributeValues={
                 ":inc": {"N": str(int(max(1, cost)))},
-                ":limit": {"N": str(int(limit))},
-                ":exp": {"N": str(int(expires_at))},
+                ":limit": {"N": str(limit)},
+                ":exp": {"N": str(expires_at)},
             },
+            ReturnValues="UPDATED_NEW",
         )
+        print("RATE_LIMIT_DEBUG_OK " + json.dumps({"http": resp.get("ResponseMetadata", {}).get("HTTPStatusCode"), "attrs": resp.get("Attributes")}))
+
         return True
 
     except _ddb.exceptions.ConditionalCheckFailedException:
+        print("RATE_LIMIT_DEBUG_THROTTLED " + json.dumps({"pk": pk, "limit": limit}))
         return False
 
     except Exception as e:
-        print(f"RATE_LIMIT_DDB_WARN — {e}")
-        _emit_metric("RateLimitDdbError", 1, endpoint=endpoint, key_hash=key_hash)
-        return True
+        # TEMP: fail-closed so we surface the real root cause
+        print("RATE_LIMIT_DEBUG_ERR " + json.dumps({"err": repr(e), "pk": pk, "table": table}))
+        raise
 
 
 # -------------------------
@@ -220,7 +251,9 @@ def _utc_yyyymmdd() -> str:
 
 def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
     now = datetime.now(timezone.utc)
-    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(
+        days=1
+    )
     return int((tomorrow_midnight + timedelta(minutes=extra_minutes)).timestamp())
 
 
@@ -228,8 +261,15 @@ def _quota_pk(key_hash: str) -> str:
     return f"quota#{key_hash}#{_utc_yyyymmdd()}"
 
 
+# -------------------------
+# Plans mapping (DynamoDB) — key_hash -> plan -> daily_limit
+# -------------------------
+PLAN_ENABLED = os.getenv("PLAN_ENABLED", "1") == "1"
+PLAN_CACHE_SECONDS = int(os.getenv("PLAN_CACHE_SECONDS", "60"))
+PLAN_DEBUG = os.getenv("PLAN_DEBUG", "0") == "1"
+
 PLAN_DEFAULTS = {"free": 200, "pro": 2000, "enterprise": 10000}
-_plan_cache: dict[str, dict] = {}  # key_hash -> {"limit": int, "plan": str, "exp": epoch}
+_plan_cache: dict[str, dict] = {}
 
 
 def _plan_pk(key_hash: str) -> str:
@@ -237,24 +277,25 @@ def _plan_pk(key_hash: str) -> str:
 
 
 def _plan_get_limit(key_hash: str) -> tuple[str, int]:
-    env = _quota_env()
-    if not env["PLAN_ENABLED"]:
-        return ("pro", int(env["QUOTA_DAILY_LIMIT"]))
+    if not PLAN_ENABLED:
+        return ("pro", int(_quota_daily_limit_default()))
 
     now = int(time.time())
-    cache_seconds = int(env["PLAN_CACHE_SECONDS"])
-
-    if cache_seconds > 0:
+    if PLAN_CACHE_SECONDS > 0:
         hit = _plan_cache.get(key_hash)
         if hit and hit.get("exp", 0) > now:
             return (hit["plan"], int(hit["limit"]))
 
     plan = "pro"
-    limit = int(env["QUOTA_DAILY_LIMIT"])
-    quota_table = env["QUOTA_TABLE"]
+    limit = int(_quota_daily_limit_default())
+    table = _quota_table()
 
     try:
-        resp = _ddb.get_item(TableName=quota_table, Key={"pk": {"S": _plan_pk(key_hash)}}, ConsistentRead=False)
+        resp = _ddb.get_item(
+            TableName=table,
+            Key={"pk": {"S": _plan_pk(key_hash)}},
+            ConsistentRead=False,
+        )
         item = resp.get("Item")
         if item:
             if "plan" in item and "S" in item["plan"]:
@@ -266,10 +307,10 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
         else:
             limit = int(PLAN_DEFAULTS.get(plan, limit))
 
-        if cache_seconds > 0:
-            _plan_cache[key_hash] = {"plan": plan, "limit": limit, "exp": now + cache_seconds}
+        if PLAN_CACHE_SECONDS > 0:
+            _plan_cache[key_hash] = {"plan": plan, "limit": limit, "exp": now + PLAN_CACHE_SECONDS}
 
-        if env["PLAN_DEBUG"]:
+        if PLAN_DEBUG:
             print(f"PLAN_DEBUG key_hash={key_hash} plan={plan} limit={limit}")
 
         return (plan, limit)
@@ -277,20 +318,20 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
     except Exception as e:
         print(f"PLAN_DDB_WARN — {e}")
         _emit_metric("PlanLookupError", 1, key_hash=key_hash)
-        return ("pro", int(env["QUOTA_DAILY_LIMIT"]))
+        return ("pro", int(_quota_daily_limit_default()))
 
 
 def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: int, cost: int = 1) -> bool:
-    env = _quota_env()
-    if not env["QUOTA_ENABLED"]:
+    if not _quota_enabled():
         return True
 
     pk = _quota_pk(key_hash)
     expires_at = _next_midnight_utc_epoch(extra_minutes=10)
+    table = _quota_table()
 
     try:
         _ddb.update_item(
-            TableName=env["QUOTA_TABLE"],
+            TableName=table,
             Key={"pk": {"S": pk}},
             UpdateExpression="SET #n = if_not_exists(#n, :z) + :c, expires_at = :exp",
             ConditionExpression="attribute_not_exists(#n) OR #n < :limit",
@@ -317,7 +358,11 @@ def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: i
 PUBLIC_PATHS = {"/health"}
 ADMIN_PATHS = {"/admin/plan"}
 
-ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()  # "1.2.3.4/32,5.6.7.0/24"
+ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()
+
+
+def _sha256_12(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
 
 def _ip_allowed(ip: Optional[str]) -> bool:
@@ -358,17 +403,17 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
 
 
 # -------------------------
-# Local (in-memory) rate limiter
+# Local (in-memory) rate limiter (fallback / extra)
 # -------------------------
-_local_buckets: dict[str, dict[str, float]] = {}  # {bucket_id: {"tokens":x,"last":ts}}
-
-
 def _rate_limit_rps() -> float:
     return float(os.getenv("RATE_LIMIT_RPS", "3"))
 
 
 def _rate_limit_burst() -> float:
     return float(os.getenv("RATE_LIMIT_BURST", "10"))
+
+
+_local_buckets: dict[str, dict[str, float]] = {}
 
 
 def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> bool:
@@ -420,6 +465,14 @@ async def api_key_middleware(request: Request, call_next):
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
+    # Small debug breadcrumb (helps confirm env is being read)
+    if endpoint == "/signal" and _global_rate_enabled():
+        # keep it low-noise: only occasionally
+        if int(time.time()) % 20 == 0:
+            print(
+                f"RL_DEBUG enabled=1 rps={_global_rps()} burst={_global_burst()} window={_global_window_seconds()} table={_rate_table()}"
+            )
+
     if endpoint in BILLABLE_PATHS:
         plan, limit = _plan_get_limit(request.state.key_hash)
         ok = _quota_allow_request_with_limit(request.state.key_hash, endpoint, daily_limit=limit, cost=1)
@@ -439,36 +492,7 @@ async def api_key_middleware(request: Request, call_next):
 
 
 # -------------------------
-# Debug endpoint (API-key protected)
-# -------------------------
-@app.get("/debug/rate-limit")
-def debug_rate_limit(request: Request):
-    key_hash = getattr(request.state, "key_hash", None)
-    if not key_hash:
-        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-
-    env = _rate_env()
-    now = _epoch_s()
-    window = max(1, int(env["GLOBAL_WINDOW_SECONDS"]))
-    win = now // window
-    pk = _ddb_pk(key_hash, "/signal", win)
-    limit = int(max(0.01, float(env["GLOBAL_RPS"])) * window + max(0.0, float(env["GLOBAL_BURST"])))
-    limit = max(1, limit)
-
-    return {
-        "now": now,
-        "window_seconds": window,
-        "window_id": win,
-        "pk_example": pk,
-        "rate_table": env["RATE_TABLE"],
-        "enabled": env["GLOBAL_RATE_ENABLED"],
-        "limit_per_window": limit,
-        "ttl_seconds": int(env["GLOBAL_TTL_SECONDS"]),
-    }
-
-
-# -------------------------
-# Admin schemas + routes (NOTE: requires dynamodb:PutItem permission)
+# Admin schemas + routes
 # -------------------------
 class AdminPlanUpsertRequest(BaseModel):
     api_key: Optional[str] = None
@@ -505,7 +529,6 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
     if daily_limit < 1:
         return JSONResponse({"detail": "daily_limit must be >= 1"}, status_code=400)
 
-    quota_table = _quota_env()["QUOTA_TABLE"]
     pk = _plan_pk(kh)
     updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -518,11 +541,17 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
     if payload.note:
         item["note"] = {"S": str(payload.note)[:500]}
 
-    _ddb.put_item(TableName=quota_table, Item=item)
+    _ddb.put_item(TableName=_quota_table(), Item=item)
     _plan_cache.pop(kh, None)
     _emit_metric("AdminPlanUpsert", 1, key_hash=kh, plan=plan)
 
-    return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at)
+    return AdminPlanResponse(
+        key_hash=kh,
+        pk=pk,
+        plan=plan,
+        daily_limit=daily_limit,
+        updated_at=updated_at,
+    )
 
 
 @app.get("/admin/plan", response_model=AdminPlanResponse)
@@ -531,9 +560,8 @@ def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Op
     if not kh:
         return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
 
-    quota_table = _quota_env()["QUOTA_TABLE"]
     pk = _plan_pk(kh)
-    resp = _ddb.get_item(TableName=quota_table, Key={"pk": {"S": pk}}, ConsistentRead=False)
+    resp = _ddb.get_item(TableName=_quota_table(), Key={"pk": {"S": pk}}, ConsistentRead=False)
     item = resp.get("Item")
     if not item:
         plan, limit = _plan_get_limit(kh)
@@ -541,13 +569,14 @@ def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Op
         return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at)
 
     plan = item.get("plan", {}).get("S", "pro")
-    daily_limit = int(float(item.get("daily_limit", {}).get("N", str(_quota_env()["QUOTA_DAILY_LIMIT"]))))
+    daily_limit = int(float(item.get("daily_limit", {}).get("N", str(_quota_daily_limit_default()))))
     updated_at = item.get("updated_at", {}).get("S", "")
+
     return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at)
 
 
 # -------------------------
-# Usage endpoint
+# Usage endpoint (non-billable)
 # -------------------------
 @app.get("/usage")
 def usage(request: Request):
@@ -555,13 +584,12 @@ def usage(request: Request):
     if not key_hash:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
-    env = _quota_env()
     plan, limit = _plan_get_limit(key_hash)
     pk = _quota_pk(key_hash)
 
     used = 0
     try:
-        resp = _ddb.get_item(TableName=env["QUOTA_TABLE"], Key={"pk": {"S": pk}}, ConsistentRead=False)
+        resp = _ddb.get_item(TableName=_quota_table(), Key={"pk": {"S": pk}}, ConsistentRead=False)
         item = resp.get("Item")
         if item and "n" in item and "N" in item["n"]:
             used = int(float(item["n"]["N"]))
@@ -585,7 +613,7 @@ def usage(request: Request):
 
 
 # -------------------------
-# Signal + backtest logic (unchanged)
+# Helpers
 # -------------------------
 def _signal_to_text(sig: int) -> str:
     return "BUY" if sig > 0 else "SELL" if sig < 0 else "HOLD"
@@ -623,6 +651,7 @@ def _extract_latest_features(df: pd.DataFrame) -> dict:
     out = {}
     if df is None or len(df) == 0:
         return out
+
     row = df.iloc[-1]
     for c in preferred:
         if c in df.columns:
@@ -635,13 +664,21 @@ def _extract_latest_features(df: pd.DataFrame) -> dict:
     return out
 
 
-def _build_explain(asset: str, mode: str, price_df: pd.DataFrame, latest_signal: int, latest_sentiment: Optional[float]) -> "ExplainBlock":
+def _build_explain(
+    asset: str,
+    mode: str,
+    price_df: pd.DataFrame,
+    latest_signal: int,
+    latest_sentiment: Optional[float],
+) -> "ExplainBlock":
     features = _extract_latest_features(price_df)
+
     parts = [
         f"Asset: {asset}",
         f"Mode: {mode}",
         f"Decision: {_signal_to_text(latest_signal)} ({latest_signal})",
     ]
+
     if features:
         shown = []
         for k in ["close", "ma_20", "rsi_14"]:
@@ -649,12 +686,15 @@ def _build_explain(asset: str, mode: str, price_df: pd.DataFrame, latest_signal:
                 shown.append(f"{k}={features[k]:.4f}")
         if shown:
             parts.append("Key indicators: " + ", ".join(shown))
+
     if mode == "combined":
         if latest_sentiment is None:
             parts.append("Sentiment: unavailable")
         else:
             parts.append(f"Sentiment (Fear&Greed normalized 0–1): {latest_sentiment:.4f}")
-    parts.append("Note: decision is produced by the deployed rule-based engine; this block exposes the inputs used for transparency.")
+
+    parts.append("Note: decision is produced by the deployed rule-based engine; this block exposes inputs for transparency.")
+
     facts = {
         "engine": {"price": "generate_rule_based_signal", "combined": "generate_combined_signal"},
         "latest_signal": latest_signal,
@@ -671,11 +711,18 @@ def _load_price_pipeline(asset: str):
         price = load_price_data(symbol_filter=symbol_filter)
     except FileNotFoundError as e:
         _emit_metric("PriceDataMissing", 1, asset=asset)
-        return JSONResponse(status_code=404, content={"detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"})
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"},
+        )
+
     feat = build_price_feature_set(price)
     return generate_rule_based_signal(feat)
 
 
+# -------------------------
+# Sentiment
+# -------------------------
 FNG_URL = "https://api.alternative.me/fng/?limit=1&format=json"
 
 
@@ -693,6 +740,9 @@ def _load_aligned_sentiment(asset: str, price_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(index=price_df.index, data={"sentiment_score": _get_fear_greed_score()})
 
 
+# -------------------------
+# Schemas
+# -------------------------
 class ExplainBlock(BaseModel):
     summary: str
     facts: dict = Field(default_factory=dict)
@@ -736,6 +786,9 @@ class BacktestResponse(BaseModel):
     buy_hold_equity_end: float
 
 
+# -------------------------
+# Routes
+# -------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -758,6 +811,12 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
 
         if cached and _is_fresh(cached.get("cached_at", ""), ttl) and explain != 1:
             _emit_metric("CacheHit", 1, asset=asset, mode=mode)
+
+            age = _age_seconds(cached.get("cached_at", ""))
+            if age is not None:
+                _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
+            _emit_metric("CacheFresh", 1, unit="Count", asset=asset, mode=mode)
+
             _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
             return SignalResponse(
                 asset=asset,
@@ -771,6 +830,7 @@ def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] =
             )
 
         _emit_metric("CacheMiss", 1, asset=asset, mode=mode)
+        _emit_metric("CacheFresh", 0, unit="Count", asset=asset, mode=mode)
 
         price_sig = _load_price_pipeline(asset)
         if isinstance(price_sig, JSONResponse):
@@ -832,6 +892,34 @@ def get_signal_explain(asset: str = "BTC-USD", mode: Literal["price_only", "comb
     return get_signal(asset=asset, mode=mode, explain=1)
 
 
+@app.get("/debug/cache/read")
+def debug_cache_read(asset: str = "BTC-USD", mode: str = "combined"):
+    try:
+        bucket = cache_bucket()
+    except Exception:
+        return {"enabled": False, "reason": "SIGNALS_BUCKET not set"}
+
+    key = cache_key(asset, mode)
+    ttl = _cache_ttl_seconds()
+    cached = read_latest_signal(asset, mode)
+
+    if not cached:
+        return {"enabled": True, "found": False, "bucket": bucket, "key": key, "ttl_seconds": ttl}
+
+    age = _age_seconds(cached.get("cached_at", ""))
+    return {
+        "enabled": True,
+        "found": True,
+        "bucket": bucket,
+        "key": key,
+        "ttl_seconds": ttl,
+        "cached_at": cached.get("cached_at"),
+        "age_seconds": age,
+        "fresh": age is not None and age <= ttl,
+        "payload": cached,
+    }
+
+
 def _max_drawdown(equity: pd.Series) -> float:
     peak = equity.cummax()
     dd = (equity / peak) - 1.0
@@ -880,10 +968,15 @@ def backtest(
 
         total_return = float(equity.iloc[-1] - 1.0)
         vol = float(strat_ret.std() * (annualization**0.5))
-        sharpe = float((strat_ret.mean() * annualization) / (strat_ret.std() * (annualization**0.5) + 1e-12))
+        sharpe = float(
+            (strat_ret.mean() * annualization)
+            / (strat_ret.std() * (annualization**0.5) + 1e-12)
+        )
         mdd = _max_drawdown(equity)
 
-        trades = int((trade == 1.0).sum())
+        trade_idx = df.index[trade == 1.0]
+        trades = int(len(trade_idx))
+
         wins = int((strat_ret > 0).sum())
         win_rate = float(wins / max(1, int((pos != 0).sum())))
 
@@ -892,7 +985,10 @@ def backtest(
         bh_mdd = _max_drawdown(bh_equity)
         bh_end = float(bh_equity.iloc[-1])
 
-        pts = [BacktestPoint(t=ts.isoformat(), equity=float(v)) for ts, v in equity.tail(200).items()]
+        pts = []
+        tail = equity.tail(200)
+        for ts, v in tail.items():
+            pts.append(BacktestPoint(t=ts.isoformat(), equity=float(v)))
 
         resp = BacktestResponse(
             asset=asset,
