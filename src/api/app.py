@@ -421,13 +421,40 @@ def _rl_json(
 # API Key + Admin Key (+ Admin IP allowlist)
 # -------------------------
 PUBLIC_PATHS = {"/health"}
-ADMIN_PATHS = {"/admin/plan"}
+ADMIN_PATHS = {"/admin/plan", "/admin/whoami"}
 
 ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()
 
 
 def _sha256_12(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+
+def _get_client_ip(request: Request) -> Optional[str]:
+    """
+    Extract the real client IP behind Lambda Function URL / API Gateway.
+    Prefer X-Forwarded-For (first IP), then CF / X-Real-IP.
+    """
+    try:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            # "client, proxy1, proxy2" -> take first
+            ip = xff.split(",")[0].strip()
+            if ip:
+                return ip
+
+        cf = request.headers.get("cf-connecting-ip", "").strip()
+        if cf:
+            return cf
+
+        xri = request.headers.get("x-real-ip", "").strip()
+        if xri:
+            return xri
+
+        # last fallback
+        return getattr(getattr(request, "client", None), "host", None)
+    except Exception:
+        return None
 
 
 def _ip_allowed(ip: Optional[str]) -> bool:
@@ -449,46 +476,6 @@ def _ip_allowed(ip: Optional[str]) -> bool:
         return False
 
 
-def _get_client_ip(request: Request) -> Optional[str]:
-    """
-    Best-effort real client IP extraction for Lambda Function URL / proxies.
-
-    Priority:
-      1) CloudFront-Viewer-Address: "IP:port"
-      2) X-Forwarded-For: "client, proxy1, proxy2"
-      3) X-Real-IP
-      4) request.client.host (fallback)
-    """
-    try:
-        h = request.headers
-
-        cva = h.get("cloudfront-viewer-address")
-        if cva:
-            ip = cva.split(",")[0].strip().split(":")[0].strip()
-            if ip:
-                return ip
-
-        xff = h.get("x-forwarded-for")
-        if xff:
-            ip = xff.split(",")[0].strip()
-            if ip:
-                return ip
-
-        xri = h.get("x-real-ip")
-        if xri:
-            ip = xri.strip()
-            if ip:
-                return ip
-
-        client = getattr(request, "client", None)
-        if client and getattr(client, "host", None):
-            return client.host
-
-        return None
-    except Exception:
-        return None
-
-
 def _require_admin(request: Request) -> Optional[JSONResponse]:
     admin_key = _get_admin_key()
     if not admin_key:
@@ -505,6 +492,20 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     return None
+
+
+@app.get("/admin/whoami")
+def admin_whoami(request: Request):
+    """
+    Admin-only debug: shows what IP the server sees + forwarding headers.
+    """
+    return {
+        "client_ip": _get_client_ip(request),
+        "request_client_host": getattr(getattr(request, "client", None), "host", None),
+        "x_forwarded_for": request.headers.get("x-forwarded-for"),
+        "x_real_ip": request.headers.get("x-real-ip"),
+        "cf_connecting_ip": request.headers.get("cf-connecting-ip"),
+    }
 
 
 # -------------------------
