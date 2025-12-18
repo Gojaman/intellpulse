@@ -449,12 +449,52 @@ def _ip_allowed(ip: Optional[str]) -> bool:
         return False
 
 
+def _get_client_ip(request: Request) -> Optional[str]:
+    """
+    Best-effort real client IP extraction for Lambda Function URL / proxies.
+
+    Priority:
+      1) CloudFront-Viewer-Address: "IP:port"
+      2) X-Forwarded-For: "client, proxy1, proxy2"
+      3) X-Real-IP
+      4) request.client.host (fallback)
+    """
+    try:
+        h = request.headers
+
+        cva = h.get("cloudfront-viewer-address")
+        if cva:
+            ip = cva.split(",")[0].strip().split(":")[0].strip()
+            if ip:
+                return ip
+
+        xff = h.get("x-forwarded-for")
+        if xff:
+            ip = xff.split(",")[0].strip()
+            if ip:
+                return ip
+
+        xri = h.get("x-real-ip")
+        if xri:
+            ip = xri.strip()
+            if ip:
+                return ip
+
+        client = getattr(request, "client", None)
+        if client and getattr(client, "host", None):
+            return client.host
+
+        return None
+    except Exception:
+        return None
+
+
 def _require_admin(request: Request) -> Optional[JSONResponse]:
     admin_key = _get_admin_key()
     if not admin_key:
         return JSONResponse({"detail": "ADMIN_KEY not configured"}, status_code=503)
 
-    client_ip = getattr(getattr(request, "client", None), "host", None)
+    client_ip = _get_client_ip(request)
     if not _ip_allowed(client_ip):
         _emit_metric("AdminIpDenied", 1, endpoint=request.url.path, ip=client_ip or "none")
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
