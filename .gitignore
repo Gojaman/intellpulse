@@ -16,3 +16,9 @@ venv/
 # Local build artifacts
 build/
 env*.json
+
+# Secrets
+.env
+.env.*
+*.key
+secrets.*
