@@ -225,7 +225,15 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
             },
             ReturnValues="UPDATED_NEW",
         )
-        print("RATE_LIMIT_DEBUG_OK " + json.dumps({"http": resp.get("ResponseMetadata", {}).get("HTTPStatusCode"), "attrs": resp.get("Attributes")}))
+        print(
+            "RATE_LIMIT_DEBUG_OK "
+            + json.dumps(
+                {
+                    "http": resp.get("ResponseMetadata", {}).get("HTTPStatusCode"),
+                    "attrs": resp.get("Attributes"),
+                }
+            )
+        )
 
         return True
 
@@ -235,7 +243,10 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
 
     except Exception as e:
         # TEMP: fail-closed so we surface the real root cause
-        print("RATE_LIMIT_DEBUG_ERR " + json.dumps({"err": repr(e), "pk": pk, "table": table}))
+        print(
+            "RATE_LIMIT_DEBUG_ERR "
+            + json.dumps({"err": repr(e), "pk": pk, "table": table})
+        )
         raise
 
 
@@ -321,7 +332,9 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
         return ("pro", int(_quota_daily_limit_default()))
 
 
-def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: int, cost: int = 1) -> bool:
+def _quota_allow_request_with_limit(
+    key_hash: str, endpoint: str, daily_limit: int, cost: int = 1
+) -> bool:
     if not _quota_enabled():
         return True
 
@@ -350,6 +363,58 @@ def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: i
         print(f"QUOTA_DDB_WARN — {e}")
         _emit_metric("QuotaError", 1, endpoint=endpoint, key_hash=key_hash)
         return True
+
+
+# -------------------------
+# Quota status + unified 429 response helper (MVP-grade)
+# -------------------------
+def _quota_status(key_hash: str) -> tuple[int, int]:
+    """
+    Returns (used_today, reset_epoch).
+    Only used on the quota-exceeded path.
+    """
+    pk = _quota_pk(key_hash)
+    used = 0
+    reset_epoch = _next_midnight_utc_epoch(extra_minutes=10)
+
+    try:
+        resp = _ddb.get_item(
+            TableName=_quota_table(),
+            Key={"pk": {"S": pk}},
+            ConsistentRead=False,
+        )
+        item = resp.get("Item") or {}
+        if "n" in item and "N" in item["n"]:
+            used = int(float(item["n"]["N"]))
+        if "expires_at" in item and "N" in item["expires_at"]:
+            reset_epoch = int(float(item["expires_at"]["N"]))
+    except Exception as e:
+        print(f"QUOTA_STATUS_WARN — {e}")
+
+    return used, reset_epoch
+
+
+def _rl_json(
+    status_code: int,
+    body: dict,
+    *,
+    limit: Optional[int] = None,
+    remaining: Optional[int] = None,
+    reset_epoch: Optional[int] = None,
+) -> JSONResponse:
+    headers: dict[str, str] = {}
+
+    if reset_epoch is not None:
+        headers["X-RateLimit-Reset"] = str(int(reset_epoch))
+        retry_after = max(1, int(reset_epoch) - _epoch_s())
+        headers["Retry-After"] = str(retry_after)
+
+    if limit is not None:
+        headers["X-RateLimit-Limit"] = str(int(limit))
+    if remaining is not None:
+        headers["X-RateLimit-Remaining"] = str(int(remaining))
+
+    return JSONResponse(content=body, status_code=status_code, headers=headers)
 
 
 # -------------------------
@@ -473,20 +538,57 @@ async def api_key_middleware(request: Request, call_next):
                 f"RL_DEBUG enabled=1 rps={_global_rps()} burst={_global_burst()} window={_global_window_seconds()} table={_rate_table()}"
             )
 
+    # --- QUOTA (daily) ---
     if endpoint in BILLABLE_PATHS:
         plan, limit = _plan_get_limit(request.state.key_hash)
-        ok = _quota_allow_request_with_limit(request.state.key_hash, endpoint, daily_limit=limit, cost=1)
+        ok = _quota_allow_request_with_limit(
+            request.state.key_hash, endpoint, daily_limit=limit, cost=1
+        )
         if not ok:
-            _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=request.state.key_hash, plan=plan)
-            return JSONResponse({"detail": "Quota exceeded", "plan": plan, "daily_limit": limit}, status_code=429)
+            used, reset_epoch = _quota_status(request.state.key_hash)
+            remaining = max(0, int(limit) - int(used))
+            _emit_metric(
+                "ApiKeyQuotaExceeded",
+                1,
+                endpoint=endpoint,
+                key_hash=request.state.key_hash,
+                plan=plan,
+            )
+            return _rl_json(
+                429,
+                {
+                    "error": "quota_exceeded",
+                    "message": "Quota exceeded",
+                    "plan": plan,
+                    "daily_limit": int(limit),
+                    "used_today": int(used),
+                    "remaining": int(remaining),
+                    "reset_epoch": int(reset_epoch),
+                },
+                limit=int(limit),
+                remaining=int(remaining),
+                reset_epoch=int(reset_epoch),
+            )
 
+    # --- GLOBAL (DDB fixed window) ---
     if not _global_allow_request(request.state.key_hash, endpoint, cost=1):
         _emit_metric("RateLimitedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+        window = max(1, int(_global_window_seconds()))
+        reset_epoch = ((_epoch_s() // window) + 1) * window
+        return _rl_json(
+            429,
+            {"error": "rate_limited_global", "message": "Rate limit exceeded"},
+            reset_epoch=reset_epoch,
+        )
 
+    # --- LOCAL (in-memory token bucket) ---
     if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
         _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+        return _rl_json(
+            429,
+            {"error": "rate_limited_local", "message": "Rate limit exceeded"},
+            reset_epoch=_epoch_s() + 1,
+        )
 
     return await call_next(request)
 
@@ -555,7 +657,9 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
 
 
 @app.get("/admin/plan", response_model=AdminPlanResponse)
-def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None):
+def admin_plan_get(
+    request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None
+):
     kh = _resolve_key_hash(api_key, key_hash)
     if not kh:
         return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
@@ -566,13 +670,17 @@ def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Op
     if not item:
         plan, limit = _plan_get_limit(kh)
         updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at)
+        return AdminPlanResponse(
+            key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at
+        )
 
     plan = item.get("plan", {}).get("S", "pro")
     daily_limit = int(float(item.get("daily_limit", {}).get("N", str(_quota_daily_limit_default()))))
     updated_at = item.get("updated_at", {}).get("S", "")
 
-    return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at)
+    return AdminPlanResponse(
+        key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at
+    )
 
 
 # -------------------------
@@ -693,7 +801,9 @@ def _build_explain(
         else:
             parts.append(f"Sentiment (Fear&Greed normalized 0–1): {latest_sentiment:.4f}")
 
-    parts.append("Note: decision is produced by the deployed rule-based engine; this block exposes inputs for transparency.")
+    parts.append(
+        "Note: decision is produced by the deployed rule-based engine; this block exposes inputs for transparency."
+    )
 
     facts = {
         "engine": {"price": "generate_rule_based_signal", "combined": "generate_combined_signal"},
@@ -795,7 +905,11 @@ def health():
 
 
 @app.get("/signal", response_model=SignalResponse)
-def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined", explain: int = 0):
+def get_signal(
+    asset: str = "BTC-USD",
+    mode: Literal["price_only", "combined"] = "combined",
+    explain: int = 0,
+):
     t0 = time.time()
     _emit_metric("SignalRequest", 1, asset=asset, mode=mode)
 
