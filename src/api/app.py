@@ -557,15 +557,25 @@ async def api_key_middleware(request: Request, call_next):
         return await call_next(request)
 
     api_key = _get_api_key()
-    provided = request.headers.get("x-api-key")
+    demo_key = os.getenv("DEMO_API_KEY", "").strip()
+    provided = (request.headers.get("x-api-key") or "").strip()
 
+    # Fail closed: if endpoint is protected but API_KEY isn't configured, do NOT allow public access.
     if not api_key:
-        return await call_next(request)
+        _emit_metric("ApiKeyMisconfigured", 1, endpoint=endpoint)
+        return JSONResponse(
+            {"detail": "API key auth misconfigured (API_KEY missing)"},
+            status_code=500,
+        )
 
-    if provided != api_key:
+    # Accept either the main API key or a demo key (optional)
+    ok = (provided == api_key) or (demo_key and provided == demo_key)
+
+    if not ok:
         _emit_metric("ApiKeyUnauthorized", 1, endpoint=endpoint, key_hash="unknown")
         _emit_metric("EndpointRequest", 1, endpoint=endpoint)
         return JSONResponse({"detail": "Invalid API key"}, status_code=401)
+
 
     request.state.key_hash = _sha256_12(provided)
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
