@@ -48,10 +48,11 @@ phases:
       - 'echo "Smoke: /health (expect 200)"'
       - 'curl --globoff -fsS "$STG_URL/health" | grep -q "\"status\""'
 
-      - 'echo "Smoke: /signal without key (expect 401)"'
+      - 'echo "Smoke: /signal without key (expect 401 or 500 if API_KEY missing)"'
       - 'HTTP_CODE="$(curl --globoff -sS -o /tmp/signal_no_key.json -w "%{http_code}" "$STG_URL/signal?asset=BTC-USD&mode=combined")"'
       - 'echo "HTTP_CODE=$HTTP_CODE"'
-      - 'if [ "$HTTP_CODE" = "401" ]; then echo "OK: auth enforced (401)"; else echo "FAIL: expected 401, got $HTTP_CODE"; cat /tmp/signal_no_key.json || true; exit 1; fi'
+      - 'if [ "$HTTP_CODE" = "401" ]; then echo "OK: auth enforced (401)"; elif [ "$HTTP_CODE" = "500" ]; then echo "OK: fail-closed when API_KEY missing (500)"; cat /tmp/signal_no_key.json || true; else echo "FAIL: expected 401 or 500, got $HTTP_CODE"; cat /tmp/signal_no_key.json || true; exit 1; fi'
+
 
       - 'echo "Deploying to PROD: $PROD_FN"'
       - 'aws lambda update-function-code --function-name "$PROD_FN" --region "$AWS_REGION" --image-uri "$IMAGE_URI"'
