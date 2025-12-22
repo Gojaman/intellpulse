@@ -27,7 +27,7 @@ phases:
 
   post_build:
     commands:
-      - "set -euo pipefail"
+      - "set -eu"
 
       - "ECR_IMAGE=\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG\""
       - "echo Pushing image to ECR: $ECR_IMAGE"
@@ -48,7 +48,6 @@ phases:
       - "echo Smoke: /health (expect 200)"
       - "curl --globoff -fsS \"$STG_URL/health\" | grep -q '\"status\"'"
 
-      # 1) Auth must be enforced (best = 401). If you purposely fail-closed when API_KEY missing, accept 500 too.
       - "echo Smoke: /signal WITHOUT key (expect 401; accept 500 only if API_KEY missing)"
       - "HTTP_CODE_NO_KEY=\"$(curl --globoff --retry 8 --retry-all-errors --retry-delay 1 -sS -o /tmp/signal_no_key.json -w '%{http_code}' \"$STG_URL/signal?asset=BTC-USD&mode=combined\" || true)\""
       - "echo HTTP_CODE_NO_KEY=$HTTP_CODE_NO_KEY"
@@ -64,7 +63,6 @@ phases:
           exit 1
         fi
 
-      # 2) Authenticated request using the API_KEY stored on the STG Lambda env (do NOT print it)
       - "API_KEY=\"$(aws lambda get-function-configuration --function-name \"$STG_FN\" --region \"$AWS_REGION\" --query 'Environment.Variables.API_KEY' --output text)\""
       - |
         if [ -z "$API_KEY" ] || [ "$API_KEY" = "None" ]; then
