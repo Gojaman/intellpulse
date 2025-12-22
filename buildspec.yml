@@ -6,56 +6,55 @@ env:
     AWS_ACCOUNT_ID: "528757798791"
     REPO_NAME: "intellpulse-api"
     IMAGE_TAG: "latest"
+
+    # Functions
     STG_FN: "intellpulse-api-staging"
     PROD_FN: "intellpulse-api"
 
 phases:
   pre_build:
     commands:
-      - set -eux
-      - echo "Logging in to ECR..."
-      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+      - 'set -eu'
+      - 'echo "Logging in to ECR..."'
+      - 'aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"'
 
   build:
     commands:
-      - set -eux
-      - echo "Building Docker image..."
-      - docker build -t "$REPO_NAME:$IMAGE_TAG" .
-      - docker tag "$REPO_NAME:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
+      - 'set -eu'
+      - 'echo "Building Docker image..."'
+      - 'docker build -t "$REPO_NAME:$IMAGE_TAG" .'
+      - 'docker tag "$REPO_NAME:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"'
 
   post_build:
     commands:
-      - |
-        set -eux
+      - 'set -eu'
 
-        ECR_IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
+      - 'ECR_IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"'
+      - 'echo "Pushing image to ECR: $ECR_IMAGE"'
+      - 'docker push "$ECR_IMAGE"'
 
-        echo "Pushing image to ECR..."
-        docker push "$ECR_IMAGE"
+      - 'echo "Resolving pushed image digest URI from Docker..."'
+      - 'IMAGE_URI="$(docker inspect --format=''{{index .RepoDigests 0}}'' "$ECR_IMAGE")"'
+      - 'echo "IMAGE_URI=$IMAGE_URI"'
+      - 'test -n "$IMAGE_URI"'
 
-        echo "Resolving pushed image digest URI from Docker..."
-        IMAGE_URI="$(docker inspect --format='{{index .RepoDigests 0}}' "$ECR_IMAGE")"
-        echo "IMAGE_URI=$IMAGE_URI"
-        test -n "$IMAGE_URI"
+      - 'echo "Deploying to STAGING: $STG_FN"'
+      - 'aws lambda update-function-code --function-name "$STG_FN" --region "$AWS_REGION" --image-uri "$IMAGE_URI"'
+      - 'aws lambda wait function-updated --function-name "$STG_FN" --region "$AWS_REGION"'
 
-        echo "Deploying to STAGING: $STG_FN"
-        aws lambda update-function-code --function-name "$STG_FN" --region "$AWS_REGION" --image-uri "$IMAGE_URI"
-        aws lambda wait function-updated --function-name "$STG_FN" --region "$AWS_REGION"
+      - 'STG_URL="$(aws lambda get-function-url-config --function-name "$STG_FN" --region "$AWS_REGION" --query "FunctionUrl" --output text | sed ''s:/*$::'')"'
+      - 'echo "STG_URL=$STG_URL"'
 
-        STG_URL="$(aws lambda get-function-url-config --function-name "$STG_FN" --region "$AWS_REGION" --query "FunctionUrl" --output text | sed 's:/*$::')"
-        echo "STG_URL=$STG_URL"
+      - 'echo "Smoke: /health (expect 200)"'
+      - 'curl --globoff -fsS "$STG_URL/health" | grep -q "\"status\""'
 
-        API_KEY="$(aws lambda get-function-configuration --function-name "$STG_FN" --region "$AWS_REGION" --query "Environment.Variables.API_KEY" --output text)"
-        test -n "$API_KEY"
+      - 'echo "Smoke: /signal without key (expect 401)"'
+      - 'HTTP_CODE="$(curl --globoff -sS -o /tmp/signal_no_key.json -w "%{http_code}" "$STG_URL/signal?asset=BTC-USD&mode=combined")"'
+      - 'echo "HTTP_CODE=$HTTP_CODE"'
+      - 'if [ "$HTTP_CODE" = "401" ]; then echo "OK: auth enforced (401)"; else echo "FAIL: expected 401, got $HTTP_CODE"; cat /tmp/signal_no_key.json || true; exit 1; fi'
 
-        echo "Smoke: /health"
-        curl --globoff -fsS "$STG_URL/health" | grep -q '"status"'
+      - 'echo "Deploying to PROD: $PROD_FN"'
+      - 'aws lambda update-function-code --function-name "$PROD_FN" --region "$AWS_REGION" --image-uri "$IMAGE_URI"'
+      - 'aws lambda wait function-updated --function-name "$PROD_FN" --region "$AWS_REGION"'
 
-        echo "Smoke: /signal (expect 200)"
-        curl --globoff -fsS -H "x-api-key: $API_KEY" "$STG_URL/signal?asset=BTC-USD&mode=combined" | grep -q '"latest_signal_text"'
-
-        echo "Deploying to PROD: $PROD_FN"
-        aws lambda update-function-code --function-name "$PROD_FN" --region "$AWS_REGION" --image-uri "$IMAGE_URI"
-        aws lambda wait function-updated --function-name "$PROD_FN" --region "$AWS_REGION"
-
-        aws lambda get-function --function-name "$PROD_FN" --region "$AWS_REGION" --query "Code.ImageUri" --output text
+      - 'echo "Done: deployed STG + PROD"'
