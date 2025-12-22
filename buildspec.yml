@@ -6,63 +6,82 @@ env:
     AWS_ACCOUNT_ID: "528757798791"
     REPO_NAME: "intellpulse-api"
     IMAGE_TAG: "latest"
-
-    # Functions
     STG_FN: "intellpulse-api-staging"
     PROD_FN: "intellpulse-api"
 
 phases:
   pre_build:
     commands:
-      - 'set -eu'
-      - 'echo "Logging in to ECR..."'
-      - 'aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"'
+      - set -eu
+      - echo "Logging in to ECR..."
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 
   build:
     commands:
-      - 'set -eu'
-      - 'echo "Building Docker image..."'
-      - 'docker build -t "$REPO_NAME:$IMAGE_TAG" .'
-      - 'docker tag "$REPO_NAME:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"'
+      - set -eu
+      - echo "Building Docker image..."
+      - docker build -t "$REPO_NAME:$IMAGE_TAG" .
+      - docker tag "$REPO_NAME:$IMAGE_TAG" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
 
   post_build:
     commands:
-      - 'set -eu'
+      - set -eu
 
-      - 'echo "Pushing image to ECR..."'
-      - 'docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"'
+      - echo "Pushing image to ECR..."
+      - docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
 
-      - 'DIGEST="$(aws ecr describe-images --region "$AWS_REGION" --repository-name "$REPO_NAME" --image-ids imageTag="$IMAGE_TAG" --query "imageDetails[0].imageDigest" --output text)"'
-      - 'echo "New digest: $DIGEST"'
+      - DIGEST="$(aws ecr describe-images --region "$AWS_REGION" --repository-name "$REPO_NAME" --image-ids imageTag="$IMAGE_TAG" --query "imageDetails[0].imageDigest" --output text)"
+      - echo "New digest: $DIGEST"
 
-      - 'echo "Deploying to STAGING: $STG_FN"'
-      - 'aws lambda wait function-updated --function-name "$STG_FN" --region "$AWS_REGION" || true'
-      - 'aws lambda update-function-code --function-name "$STG_FN" --region "$AWS_REGION" --image-uri "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST"'
-      - 'aws lambda wait function-updated --function-name "$STG_FN" --region "$AWS_REGION" || true'
+      - echo "Deploying to STAGING: $STG_FN"
+      - aws lambda wait function-updated --function-name "$STG_FN" --region "$AWS_REGION" || true
+      - aws lambda update-function-code --function-name "$STG_FN" --region "$AWS_REGION" --image-uri "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST"
+      - aws lambda wait function-updated --function-name "$STG_FN" --region "$AWS_REGION" || true
 
-      - 'STG_URL="$(aws lambda get-function-url-config --function-name "$STG_FN" --region "$AWS_REGION" --query "FunctionUrl" --output text | sed "s:/*$::")"'
-      - 'echo "STG_URL=$STG_URL"'
+      - STG_URL="$(aws lambda get-function-url-config --function-name "$STG_FN" --region "$AWS_REGION" --query "FunctionUrl" --output text | sed 's:/*$::')"
+      - echo "STG_URL=$STG_URL"
 
-      - 'API_KEY="$(aws lambda get-function-configuration --function-name "$STG_FN" --region "$AWS_REGION" --query "Environment.Variables.API_KEY" --output text)"'
-      - 'test -n "$API_KEY"'
-      - 'echo "Loaded API_KEY for $STG_FN (length=${#API_KEY})"'
+      # Fetch API key from the STAGING Lambda env (do not print it)
+      - API_KEY="$(aws lambda get-function-configuration --function-name "$STG_FN" --region "$AWS_REGION" --query "Environment.Variables.API_KEY" --output text)"
+      - test -n "$API_KEY"
+      - echo "Loaded API_KEY for $STG_FN (hidden)"
 
-      - 'echo "Staging smoke test: /health (public)"'
-      - 'curl --globoff -fsS "$STG_URL/health" | grep -q "\"status\""'
+      - echo "Staging smoke test: /health (public)"
+      - curl --globoff -fsS "$STG_URL/health" | grep -q "\"status\""
 
-      - 'echo "Staging smoke test: /debug/cache/read (authenticated)"'
-      - 'RESP2="$(curl --globoff -fsS -H "x-api-key: $API_KEY" "$STG_URL/debug/cache/read?asset=BTC-USD&mode=combined")"'
-      - 'echo "$RESP2" | grep -q "\"enabled\""'
+      # Debug endpoint: print body if it fails so we can see why (without printing the key)
+      - echo "Staging smoke test: /debug/cache/read (authenticated)"
+      - DEBUG_HTTP_CODE="$(curl --globoff -sS -o /tmp/debug.json -w "%{http_code}" -H "x-api-key: $API_KEY" "$STG_URL/debug/cache/read?asset=BTC-USD&mode=combined")"
+      - echo "DEBUG_HTTP_CODE=$DEBUG_HTTP_CODE"
+      - |
+        if [ "$DEBUG_HTTP_CODE" != "200" ]; then
+          echo "DEBUG BODY:"
+          cat /tmp/debug.json || true
+          exit 1
+        fi
+      - grep -q "\"enabled\"" /tmp/debug.json
 
-      - 'echo "Staging smoke test: /signal (accept 200 or 429)"'
-      - 'HTTP_CODE="$(curl --globoff -sS -o /tmp/signal.json -w "%{http_code}" -H "x-api-key: $API_KEY" "$STG_URL/signal?asset=BTC-USD&mode=combined")"'
-      - 'echo "HTTP_CODE=$HTTP_CODE"'
-      - 'if [ "$HTTP_CODE" = "200" ]; then grep -q "\"latest_signal_text\"" /tmp/signal.json && grep -q "\"asset\":\"BTC-USD\"" /tmp/signal.json && echo "Staging /signal OK (200)"; elif [ "$HTTP_CODE" = "429" ]; then echo "Staging /signal OK (429 quota/rate-limit)"; cat /tmp/signal.json || true; else echo "Staging /signal FAILED ($HTTP_CODE)"; cat /tmp/signal.json || true; exit 1; fi'
+      - echo "Staging smoke test: /signal (accept 200 or 429)"
+      - HTTP_CODE="$(curl --globoff -sS -o /tmp/signal.json -w "%{http_code}" -H "x-api-key: $API_KEY" "$STG_URL/signal?asset=BTC-USD&mode=combined")"
+      - echo "HTTP_CODE=$HTTP_CODE"
+      - |
+        if [ "$HTTP_CODE" = "200" ]; then
+          grep -q "\"latest_signal_text\"" /tmp/signal.json
+          grep -q "\"asset\":\"BTC-USD\"" /tmp/signal.json
+          echo "Staging /signal OK (200)"
+        elif [ "$HTTP_CODE" = "429" ]; then
+          echo "Staging /signal OK (429 quota/rate-limit)"
+          cat /tmp/signal.json || true
+        else
+          echo "Staging /signal FAILED ($HTTP_CODE)"
+          cat /tmp/signal.json || true
+          exit 1
+        fi
 
-      - 'echo "Staging smoke tests OK"'
+      - echo "Staging smoke tests OK"
 
-      - 'echo "Deploying to PROD: $PROD_FN"'
-      - 'aws lambda wait function-updated --function-name "$PROD_FN" --region "$AWS_REGION" || true'
-      - 'aws lambda update-function-code --function-name "$PROD_FN" --region "$AWS_REGION" --image-uri "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST"'
-      - 'aws lambda wait function-updated --function-name "$PROD_FN" --region "$AWS_REGION" || true'
-      - 'aws lambda get-function --function-name "$PROD_FN" --region "$AWS_REGION" --query "Code.ImageUri" --output text'
+      - echo "Deploying to PROD: $PROD_FN"
+      - aws lambda wait function-updated --function-name "$PROD_FN" --region "$AWS_REGION" || true
+      - aws lambda update-function-code --function-name "$PROD_FN" --region "$AWS_REGION" --image-uri "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST"
+      - aws lambda wait function-updated --function-name "$PROD_FN" --region "$AWS_REGION" || true
+      - aws lambda get-function --function-name "$PROD_FN" --region "$AWS_REGION" --query "Code.ImageUri" --output text
