@@ -31,8 +31,6 @@ phases:
   post_build:
     commands:
       - set -eu
-      # prevent zsh/glob issues if a shell ever evaluates brackets; harmless in CodeBuild
-      - (setopt NO_NOMATCH 2>/dev/null || true)
 
       - echo "Pushing image to ECR..."
       - docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$IMAGE_TAG"
@@ -45,7 +43,7 @@ phases:
       - aws lambda update-function-code --function-name "$STG_FN" --region "$AWS_REGION" --image-uri "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME@$DIGEST"
       - aws lambda wait function-updated --function-name "$STG_FN" --region "$AWS_REGION" || true
 
-      # Resolve the *current* Function URL dynamically (no hardcoded STG_URL in repo)
+      # Resolve the current Function URL dynamically (no hardcoded STG_URL in repo)
       - STG_URL="$(aws lambda get-function-url-config --function-name "$STG_FN" --region "$AWS_REGION" --query "FunctionUrl" --output text | sed 's:/*$::')"
       - echo "STG_URL=$STG_URL"
 
@@ -61,19 +59,7 @@ phases:
       - echo "Staging smoke test: /signal (authenticated) — accept 200 or 429"
       - HTTP_CODE="$(curl -sS -o /tmp/signal.json -w "%{http_code}" -H "x-api-key: $API_KEY" "$STG_URL/signal?asset=BTC-USD&mode=combined")"
       - echo "HTTP_CODE=$HTTP_CODE"
-      - |
-        if [ "$HTTP_CODE" = "200" ]; then
-          grep -q '"latest_signal_text"' /tmp/signal.json
-          grep -q '"asset":"BTC-USD"' /tmp/signal.json
-          echo "Staging /signal OK (200)"
-        elif [ "$HTTP_CODE" = "429" ]; then
-          echo "Staging /signal OK (429 quota/rate-limit)"
-          cat /tmp/signal.json || true
-        else
-          echo "Staging /signal FAILED ($HTTP_CODE)"
-          cat /tmp/signal.json || true
-          exit 1
-        fi
+      - 'if [ "$HTTP_CODE" = "200" ]; then grep -q "\"latest_signal_text\"" /tmp/signal.json && grep -q "\"asset\":\"BTC-USD\"" /tmp/signal.json && echo "Staging /signal OK (200)"; elif [ "$HTTP_CODE" = "429" ]; then echo "Staging /signal OK (429 quota/rate-limit)"; cat /tmp/signal.json || true; else echo "Staging /signal FAILED ($HTTP_CODE)"; cat /tmp/signal.json || true; exit 1; fi'
 
       - echo "Staging smoke tests OK"
 
