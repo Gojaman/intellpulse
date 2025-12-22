@@ -22,3 +22,8 @@ env*.json
 .env.*
 *.key
 secrets.*
+
+# Python virtual environments
+.venv/
+venv/
+env/
