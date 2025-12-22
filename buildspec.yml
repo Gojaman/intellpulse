@@ -41,6 +41,8 @@ phases:
 
       - 'STG_URL="$(aws lambda get-function-url-config --function-name "$STG_FN" --region "$AWS_REGION" --query "FunctionUrl" --output text | sed "s:/*$::")"'
       - 'echo "STG_URL=$STG_URL"'
+      - 'API_KEY="$(aws lambda get-function-configuration --function-name "$STG_FN" --region "$AWS_REGION" --query "Environment.Variables.API_KEY" --output text)"'
+      - 'echo "Loaded API_KEY for $STG_FN (hidden)"'
 
       - 'echo "Staging smoke test: /health (public)"'
       - 'curl -fsS "$STG_URL/health" | grep -q "\"status\""'
@@ -53,6 +55,7 @@ phases:
       - 'HTTP_CODE="$(curl -sS -o /tmp/signal.json -w "%{http_code}" -H "x-api-key: $API_KEY" "$STG_URL/signal?asset=BTC-USD&mode=combined")"'
       - 'echo "HTTP_CODE=$HTTP_CODE"'
       - 'if [ "$HTTP_CODE" = "200" ]; then grep -q "\"latest_signal_text\"" /tmp/signal.json && grep -q "\"asset\":\"BTC-USD\"" /tmp/signal.json && echo "Staging /signal OK (200)"; elif [ "$HTTP_CODE" = "429" ]; then echo "Staging /signal OK (429 quota/rate-limit)"; cat /tmp/signal.json || true; else echo "Staging /signal FAILED ($HTTP_CODE)"; cat /tmp/signal.json || true; exit 1; fi'
+
 
       - 'echo "Staging smoke tests OK"'
 
