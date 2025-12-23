@@ -27,3 +27,7 @@ secrets.*
 .venv/
 venv/
 env/
+200
+401
+*.log
+.DS_Store
