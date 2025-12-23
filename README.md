@@ -1,76 +1,81 @@
-Intellpulse MVP — Signal API
+# Intellpulse MVP — Signal API (AWS Lambda + FastAPI)
+This API is designed for quantitative traders, fintech teams, and developers who need programmatic market signals with transparent decision logic.
 
-Serverless quantitative signal engine (AWS Lambda + FastAPI)
+Serverless quantitative signal engine that returns **trading signals + explainability** over HTTPS.
 
-Intellpulse is a lightweight API that generates trading signals using price action and optional sentiment inputs.
-Built as a production-ready MVP with authentication, quotas, and CI/CD.
+Intellpulse is a lightweight API that generates **BUY / HOLD / SELL** signals using price action and optional sentiment inputs.  
+Built as a production-ready MVP with **API key authentication**, **quotas**, and **CI/CD**.
 
-What this MVP does
+---
 
-Endpoints
+## What this MVP does
 
-GET /health — public health check
+### Endpoints
 
-GET /signal — latest BUY / HOLD / SELL signal
+- `GET /health` — public health check (no auth)
+- `GET /signal` — latest BUY / HOLD / SELL signal  
+  - modes: `price_only`, `combined`
+- `GET /signal/explain` — signal + transparent explanation block
+- `GET /backtest` — quick strategy backtest (metrics + equity curve tail)
+- `GET /usage` — daily quota & plan status
 
-modes: price_only, combined
+---
 
-GET /signal/explain — signal + transparent explanation
+## Key features
 
-GET /backtest — quick strategy backtest (metrics + equity curve tail)
+- API key authentication (**production + demo keys**)
+- Rate limiting & daily quotas (DynamoDB)
+- FastAPI packaged as a Docker image
+- Deployed to AWS Lambda via container images
+- CI/CD with AWS CodeBuild
+- Digest-pinned production deploys (`@sha256:`)
 
-GET /usage — daily quota & plan status
+---
 
-Key features
+## Live API (Production)
 
-API key authentication (prod + demo keys)
-
-Rate limiting & daily quotas (DynamoDB)
-
-Docker image deployed to AWS Lambda
-
-CI/CD via AWS CodeBuild
-
-Digest-pinned production deploys
-
-Live API (Production)
+```bash
 BASE_URL="https://5vjql4veoxz4tnvdr462x7rdoa0bvfuo.lambda-url.us-east-1.on.aws"
-
-
+```
 🔐 Access requires an API key
-For demo access, request a DEMO_API_KEY
+For demo access, request a DEMO_API_KEY (see Demo access below).
 
-30-second demo (how anyone can test it)
-1️⃣ Health check (no auth)
+30-second demo
+Replace <REQUEST_DEMO_KEY> with a real demo key.
+
+1) Health check (no auth)
+
+
 curl "$BASE_URL/health"
-
-
 Expected:
 
-{"status":"ok"}
 
-2️⃣ Signal (authenticated)
+
+{"status":"ok"}
+2) Signal (authenticated)
+
+
 curl -H "x-api-key: <REQUEST_DEMO_KEY>" \
   "$BASE_URL/signal?asset=BTC-USD&mode=combined"
+Example response:
 
 
-Expected (example):
 
 {
   "asset": "BTC-USD",
+  "mode": "combined",
   "latest_signal_text": "HOLD",
-  "latest_sentiment": "neutral",
-  "cached_at_utc": "2025-12-23T12:01:00Z"
+  "latest_sentiment": 0.24,
+  "cached_at_utc": "2025-12-23T14:55:55Z"
 }
+3) Explainability
 
-3️⃣ Explainability
+
 curl -H "x-api-key: <REQUEST_DEMO_KEY>" \
   "$BASE_URL/signal/explain?asset=BTC-USD&mode=combined"
-
-
 Returns:
 
-signal
+signal decision
 
 indicator contributions
 
@@ -78,17 +83,20 @@ sentiment impact
 
 decision rationale
 
-Authentication behavior (by design)
-Scenario	Result
-No API key	401 Unauthorized
-Wrong API key	401 Unauthorized
-Valid API key	200 OK
-Valid demo key	200 OK
-Architecture (high level)
+## Authentication behavior (by design)
 
-FastAPI app packaged as Docker image
+| Scenario         | Result           |
+|------------------|------------------|
+| No API key       | 401 Unauthorized |
+| Wrong API key    | 401 Unauthorized |
+| Valid API key    | 200 OK           |
+| Valid demo key   | 200 OK           |
 
-AWS Lambda (Function URL) for serverless HTTPS access
+
+## Architecture (high level)
+FastAPI app packaged as a Docker image
+
+AWS Lambda Function URL for HTTPS access
 
 Amazon ECR for image storage
 
@@ -96,8 +104,7 @@ DynamoDB for rate limits, quotas, and plans
 
 AWS CodeBuild for CI/CD (digest-pinned deploys)
 
-Why this MVP exists
-
+## Why this MVP exists
 This MVP demonstrates:
 
 Real-world API design (auth, quotas, observability)
@@ -106,24 +113,33 @@ Cloud-native deployment (Lambda + containers)
 
 Quant-style signal generation with explainability
 
-A foundation for a full trading intelligence SaaS
+A strong foundation for a trading intelligence SaaS
 
-What’s next (post-MVP)
-
-User-scoped API keys (self-service)
+## What’s next (post-MVP)
+Self-serve user API keys
 
 Strategy customization
 
-Web dashboard
+Web dashboard (signals + charts)
 
 Additional assets & markets
 
-Paid plans
+Paid plans (quota-based tiers)
 
-Contact / Demo access
-
+## Demo access
 If you’re evaluating this project:
 
-Request a DEMO_API_KEY
+Request a DEMO_API_KEY directly from the project owner.
+Demo keys are manually issued and rate-limited.
 
-Or review the code + CI/CD pipeline in this repo
+
+LinkedIn DM, or
+
+GitHub issue titled “Demo key request”
+
+Or review the code + CI/CD pipeline in this repo.
+
+
+
+
+---
