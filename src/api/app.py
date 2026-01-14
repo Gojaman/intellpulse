@@ -15,7 +15,7 @@ import httpx
 import pandas as pd
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from mangum import Mangum
 from pydantic import BaseModel, Field
 
@@ -167,6 +167,23 @@ def _global_window_seconds() -> int:
 
 
 # -------------------------
+# CORS helper for early returns (401/429/etc.)
+# -------------------------
+def _corsify(request: Request, resp: Response) -> Response:
+    """
+    Ensure browser clients (Lovable) can read 401/429 responses.
+    Without these headers, fetch() often shows "Failed to fetch"
+    because the browser blocks the response on CORS.
+    """
+    origin = request.headers.get("origin")
+    resp.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+    resp.headers["Vary"] = "Origin"
+    resp.headers["Access-Control-Allow-Headers"] = "x-api-key,content-type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return resp
+
+
+# -------------------------
 # Global (DynamoDB) rate limiter (fixed-window counter)
 # -------------------------
 def _ddb_pk(key_hash: str, endpoint: str, window_id: int) -> str:
@@ -262,9 +279,9 @@ def _utc_yyyymmdd() -> str:
 
 def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
     now = datetime.now(timezone.utc)
-    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(
-        days=1
-    )
+    tomorrow_midnight = datetime(
+        now.year, now.month, now.day, tzinfo=timezone.utc
+    ) + timedelta(days=1)
     return int((tomorrow_midnight + timedelta(minutes=extra_minutes)).timestamp())
 
 
@@ -319,7 +336,11 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
             limit = int(PLAN_DEFAULTS.get(plan, limit))
 
         if PLAN_CACHE_SECONDS > 0:
-            _plan_cache[key_hash] = {"plan": plan, "limit": limit, "exp": now + PLAN_CACHE_SECONDS}
+            _plan_cache[key_hash] = {
+                "plan": plan,
+                "limit": limit,
+                "exp": now + PLAN_CACHE_SECONDS,
+            }
 
         if PLAN_DEBUG:
             print(f"PLAN_DEBUG key_hash={key_hash} plan={plan} limit={limit}")
@@ -438,7 +459,6 @@ def _get_client_ip(request: Request) -> Optional[str]:
     try:
         xff = request.headers.get("x-forwarded-for", "")
         if xff:
-            # "client, proxy1, proxy2" -> take first
             ip = xff.split(",")[0].strip()
             if ip:
                 return ip
@@ -451,7 +471,6 @@ def _get_client_ip(request: Request) -> Optional[str]:
         if xri:
             return xri
 
-        # last fallback
         return getattr(getattr(request, "client", None), "host", None)
     except Exception:
         return None
@@ -496,9 +515,6 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
 
 @app.get("/admin/whoami")
 def admin_whoami(request: Request):
-    """
-    Admin-only debug: shows what IP the server sees + forwarding headers.
-    """
     return {
         "client_ip": _get_client_ip(request),
         "request_client_host": getattr(getattr(request, "client", None), "host", None),
@@ -547,98 +563,106 @@ def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> boo
 async def api_key_middleware(request: Request, call_next):
     endpoint = request.url.path
 
+    # ✅ Allow CORS preflight requests (browser OPTIONS) — must return CORS headers
+    if request.method == "OPTIONS":
+        origin = request.headers.get("origin", "*")
+        req_headers = request.headers.get(
+            "access-control-request-headers", "x-api-key,content-type"
+        )
+        req_method = request.headers.get("access-control-request-method", "GET")
+
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": origin if origin else "*",
+                "Access-Control-Allow-Methods": req_method if req_method else "GET,POST,OPTIONS",
+                "Access-Control-Allow-Headers": req_headers,
+                "Access-Control-Max-Age": "86400",
+                "Vary": "Origin",
+            },
+        )
+
     if endpoint in PUBLIC_PATHS:
         return await call_next(request)
 
     if endpoint in ADMIN_PATHS:
         rej = _require_admin(request)
         if rej:
-            return rej
+            return _corsify(request, rej)
         return await call_next(request)
 
     api_key = _get_api_key()
     demo_key = os.getenv("DEMO_API_KEY", "").strip()
     provided = (request.headers.get("x-api-key") or "").strip()
 
-    # Fail closed: if endpoint is protected but API_KEY isn't configured, do NOT allow public access.
     if not api_key:
         _emit_metric("ApiKeyMisconfigured", 1, endpoint=endpoint)
-        return JSONResponse(
-            {"detail": "API key auth misconfigured (API_KEY missing)"},
-            status_code=500,
+        return _corsify(
+            request,
+            JSONResponse(
+                {"detail": "API key auth misconfigured (API_KEY missing)"},
+                status_code=500,
+            ),
         )
 
-    # Accept either the main API key or a demo key (optional)
     ok = (provided == api_key) or (demo_key and provided == demo_key)
 
     if not ok:
         _emit_metric("ApiKeyUnauthorized", 1, endpoint=endpoint, key_hash="unknown")
         _emit_metric("EndpointRequest", 1, endpoint=endpoint)
-        return JSONResponse({"detail": "Invalid API key"}, status_code=401)
-
+        return _corsify(request, JSONResponse({"detail": "Invalid API key"}, status_code=401))
 
     request.state.key_hash = _sha256_12(provided)
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
-    # Small debug breadcrumb (helps confirm env is being read)
-    if endpoint == "/signal" and _global_rate_enabled():
-        # keep it low-noise: only occasionally
-        if int(time.time()) % 20 == 0:
-            print(
-                f"RL_DEBUG enabled=1 rps={_global_rps()} burst={_global_burst()} window={_global_window_seconds()} table={_rate_table()}"
-            )
-
-    # --- QUOTA (daily) ---
     if endpoint in BILLABLE_PATHS:
         plan, limit = _plan_get_limit(request.state.key_hash)
-        ok = _quota_allow_request_with_limit(
+        ok2 = _quota_allow_request_with_limit(
             request.state.key_hash, endpoint, daily_limit=limit, cost=1
         )
-        if not ok:
+        if not ok2:
             used, reset_epoch = _quota_status(request.state.key_hash)
             remaining = max(0, int(limit) - int(used))
-            _emit_metric(
-                "ApiKeyQuotaExceeded",
-                1,
-                endpoint=endpoint,
-                key_hash=request.state.key_hash,
-                plan=plan,
-            )
-            return _rl_json(
-                429,
-                {
-                    "error": "quota_exceeded",
-                    "message": "Quota exceeded",
-                    "plan": plan,
-                    "daily_limit": int(limit),
-                    "used_today": int(used),
-                    "remaining": int(remaining),
-                    "reset_epoch": int(reset_epoch),
-                },
-                limit=int(limit),
-                remaining=int(remaining),
-                reset_epoch=int(reset_epoch),
+            return _corsify(
+                request,
+                _rl_json(
+                    429,
+                    {
+                        "error": "quota_exceeded",
+                        "message": "Quota exceeded",
+                        "plan": plan,
+                        "daily_limit": int(limit),
+                        "used_today": int(used),
+                        "remaining": int(remaining),
+                        "reset_epoch": int(reset_epoch),
+                    },
+                    limit=int(limit),
+                    remaining=int(remaining),
+                    reset_epoch=int(reset_epoch),
+                ),
             )
 
-    # --- GLOBAL (DDB fixed window) ---
     if not _global_allow_request(request.state.key_hash, endpoint, cost=1):
-        _emit_metric("RateLimitedGlobal", 1, endpoint=endpoint, key_hash=request.state.key_hash)
         window = max(1, int(_global_window_seconds()))
         reset_epoch = ((_epoch_s() // window) + 1) * window
-        return _rl_json(
-            429,
-            {"error": "rate_limited_global", "message": "Rate limit exceeded"},
-            reset_epoch=reset_epoch,
+        return _corsify(
+            request,
+            _rl_json(
+                429,
+                {"error": "rate_limited_global", "message": "Rate limit exceeded"},
+                reset_epoch=reset_epoch,
+            ),
         )
 
-    # --- LOCAL (in-memory token bucket) ---
     if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
-        _emit_metric("RateLimited", 1, endpoint=endpoint, key_hash=request.state.key_hash)
-        return _rl_json(
-            429,
-            {"error": "rate_limited_local", "message": "Rate limit exceeded"},
-            reset_epoch=_epoch_s() + 1,
+        return _corsify(
+            request,
+            _rl_json(
+                429,
+                {"error": "rate_limited_local", "message": "Rate limit exceeded"},
+                reset_epoch=_epoch_s() + 1,
+            ),
         )
 
     return await call_next(request)
@@ -726,7 +750,9 @@ def admin_plan_get(
         )
 
     plan = item.get("plan", {}).get("S", "pro")
-    daily_limit = int(float(item.get("daily_limit", {}).get("N", str(_quota_daily_limit_default()))))
+    daily_limit = int(
+        float(item.get("daily_limit", {}).get("N", str(_quota_daily_limit_default())))
+    )
     updated_at = item.get("updated_at", {}).get("S", "")
 
     return AdminPlanResponse(
@@ -756,7 +782,9 @@ def usage(request: Request):
         print(f"USAGE_DDB_WARN — {e}")
 
     resets_epoch = _next_midnight_utc_epoch(extra_minutes=10)
-    resets_at = datetime.fromtimestamp(resets_epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    resets_at = datetime.fromtimestamp(resets_epoch, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
     remaining = max(0, int(limit) - int(used))
 
     return {
@@ -874,7 +902,9 @@ def _load_price_pipeline(asset: str):
         _emit_metric("PriceDataMissing", 1, asset=asset)
         return JSONResponse(
             status_code=404,
-            content={"detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"},
+            content={
+                "detail": f"Price data not found for asset {asset} ({symbol_filter}). {str(e)}"
+            },
         )
 
     feat = build_price_feature_set(price)
@@ -982,7 +1012,13 @@ def get_signal(
                 _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
             _emit_metric("CacheFresh", 1, unit="Count", asset=asset, mode=mode)
 
-            _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+            _emit_metric(
+                "SignalLatencyMs",
+                (time.time() - t0) * 1000,
+                unit="Milliseconds",
+                asset=asset,
+                mode=mode,
+            )
             return SignalResponse(
                 asset=asset,
                 mode=mode,
@@ -1043,7 +1079,13 @@ def get_signal(
             except Exception:
                 _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
 
-        _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+        _emit_metric(
+            "SignalLatencyMs",
+            (time.time() - t0) * 1000,
+            unit="Milliseconds",
+            asset=asset,
+            mode=mode,
+        )
         return resp
 
     except Exception as e:
@@ -1177,7 +1219,13 @@ def backtest(
             buy_hold_equity_end=bh_end,
         )
 
-        _emit_metric("BacktestLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+        _emit_metric(
+            "BacktestLatencyMs",
+            (time.time() - t0) * 1000,
+            unit="Milliseconds",
+            asset=asset,
+            mode=mode,
+        )
         return resp
 
     except Exception as e:
