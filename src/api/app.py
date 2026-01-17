@@ -13,7 +13,7 @@ from typing import Optional
 import boto3
 import pandas as pd
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from mangum import Mangum
 
 from src.features.price_features import build_price_feature_set
@@ -29,12 +29,14 @@ from src.utils.s3_store import (
 app = FastAPI(title="Intellpulse API", version="0.2.10")
 
 # IMPORTANT:
-# Remove FastAPI CORSMiddleware to avoid duplicate Access-Control-* headers.
-# Lambda Function URL CORS + our middleware below will handle browser CORS reliably.
+# Lambda Function URL CORS is already configured (AllowOrigins ["*"] etc).
+# Do NOT add/override CORS headers in app code — it can create duplicates and cause browser "Failed to fetch".
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.get("/__routes")
 def __routes():
@@ -53,6 +55,7 @@ SERVICE_NAME = os.getenv(
     "SERVICE_NAME",
     os.getenv("AWS_LAMBDA_FUNCTION_NAME", "intellpulse-api"),
 )
+
 
 def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> None:
     try:
@@ -75,41 +78,13 @@ def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> 
     except Exception as e:
         print(f"METRICS_WARN — {e}")
 
-# -------------------------
-# CORS helper (single source of truth)
-# -------------------------
-def _add_cors_headers(resp: Response, request: Request) -> Response:
-    """
-    Ensure exactly ONE set of CORS headers on every response,
-    including 401/404/429/etc, so browsers do not fail with "Failed to fetch".
-    """
-    # Defensive: remove any existing CORS headers so we never send duplicates.
-    for h in [
-        "Access-Control-Allow-Origin",
-        "Access-Control-Allow-Headers",
-        "Access-Control-Allow-Methods",
-        "Access-Control-Expose-Headers",
-        "Access-Control-Max-Age",
-        "Vary",
-    ]:
-        if h in resp.headers:
-            del resp.headers[h]
-
-    # You can keep this as "*" since your Lambda Function URL CORS is also "*"
-    # and you are NOT using credentials.
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "x-api-key,content-type"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Expose-Headers"] = "*"
-    resp.headers["Access-Control-Max-Age"] = "86400"
-    resp.headers["Vary"] = "Origin"
-    return resp
 
 # -------------------------
 # Secrets (API key + Admin key)
 # -------------------------
 API_KEY_SECRET_ARN = os.getenv("API_KEY_SECRET_ARN", "").strip()
 ADMIN_KEY_SECRET_ARN = os.getenv("ADMIN_KEY_SECRET_ARN", "").strip()
+
 
 @lru_cache(maxsize=32)
 def _get_secret_string(secret_id: str) -> str:
@@ -139,11 +114,14 @@ def _get_secret_string(secret_id: str) -> str:
         _emit_metric("SecretsError", 1, secret_id=secret_id[:32])
         return ""
 
+
 def _get_api_key() -> str:
     return _get_secret_string(API_KEY_SECRET_ARN) or os.getenv("API_KEY", "")
 
+
 def _get_admin_key() -> str:
     return _get_secret_string(ADMIN_KEY_SECRET_ARN) or os.getenv("ADMIN_KEY", "")
+
 
 # -------------------------
 # Dynamic config getters
@@ -151,29 +129,38 @@ def _get_admin_key() -> str:
 def _rate_table() -> str:
     return os.getenv("RATE_LIMIT_TABLE", "intellpulse-rate-limit")
 
+
 def _quota_enabled() -> bool:
     return os.getenv("QUOTA_ENABLED", "0") == "1"
+
 
 def _quota_table() -> str:
     return os.getenv("QUOTA_TABLE", _rate_table())
 
+
 def _quota_daily_limit_default() -> int:
     return int(os.getenv("QUOTA_DAILY_LIMIT", "2000"))
+
 
 def _global_rate_enabled() -> bool:
     return os.getenv("GLOBAL_RATE_LIMIT_ENABLED", "0") == "1"
 
+
 def _global_rps() -> float:
     return float(os.getenv("GLOBAL_RATE_LIMIT_RPS", "3"))
+
 
 def _global_burst() -> float:
     return float(os.getenv("GLOBAL_RATE_LIMIT_BURST", "10"))
 
+
 def _global_ttl_seconds() -> int:
     return int(os.getenv("GLOBAL_RATE_LIMIT_TTL_SECONDS", "3600"))
 
+
 def _global_window_seconds() -> int:
     return int(os.getenv("GLOBAL_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
 
 # -------------------------
 # Global rate limiter (DynamoDB)
@@ -181,8 +168,10 @@ def _global_window_seconds() -> int:
 def _ddb_pk(key_hash: str, endpoint: str, window_id: int) -> str:
     return f"{key_hash}#{endpoint}#{window_id}"
 
+
 def _epoch_s() -> int:
     return int(time.time())
+
 
 def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
     if not _global_rate_enabled():
@@ -218,21 +207,26 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
     except _ddb.exceptions.ConditionalCheckFailedException:
         return False
 
+
 # -------------------------
 # Usage quotas (DynamoDB)
 # -------------------------
 BILLABLE_PATHS = {"/signal", "/signal/explain", "/backtest"}
 
+
 def _utc_yyyymmdd() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
+
 
 def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
     now = datetime.now(timezone.utc)
     tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
     return int((tomorrow_midnight + timedelta(minutes=extra_minutes)).timestamp())
 
+
 def _quota_pk(key_hash: str) -> str:
     return f"quota#{key_hash}#{_utc_yyyymmdd()}"
+
 
 # -------------------------
 # Plans mapping (DynamoDB)
@@ -244,8 +238,10 @@ PLAN_DEBUG = os.getenv("PLAN_DEBUG", "0") == "1"
 PLAN_DEFAULTS = {"free": 200, "pro": 2000, "enterprise": 10000}
 _plan_cache: dict[str, dict] = {}
 
+
 def _plan_pk(key_hash: str) -> str:
     return f"plan#{key_hash}"
+
 
 def _plan_get_limit(key_hash: str) -> tuple[str, int]:
     if not PLAN_ENABLED:
@@ -288,6 +284,7 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
         _emit_metric("PlanLookupError", 1, key_hash=key_hash)
         return ("pro", int(_quota_daily_limit_default()))
 
+
 def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: int, cost: int = 1) -> bool:
     if not _quota_enabled():
         return True
@@ -318,6 +315,7 @@ def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: i
         _emit_metric("QuotaError", 1, endpoint=endpoint, key_hash=key_hash)
         return True
 
+
 def _quota_status(key_hash: str) -> tuple[int, int]:
     pk = _quota_pk(key_hash)
     used = 0
@@ -339,7 +337,15 @@ def _quota_status(key_hash: str) -> tuple[int, int]:
 
     return used, reset_epoch
 
-def _rl_json(status_code: int, body: dict, *, limit: Optional[int] = None, remaining: Optional[int] = None, reset_epoch: Optional[int] = None) -> JSONResponse:
+
+def _rl_json(
+    status_code: int,
+    body: dict,
+    *,
+    limit: Optional[int] = None,
+    remaining: Optional[int] = None,
+    reset_epoch: Optional[int] = None,
+) -> JSONResponse:
     headers: dict[str, str] = {}
 
     if reset_epoch is not None:
@@ -354,6 +360,7 @@ def _rl_json(status_code: int, body: dict, *, limit: Optional[int] = None, remai
 
     return JSONResponse(content=body, status_code=status_code, headers=headers)
 
+
 # -------------------------
 # API Key + Admin Key
 # -------------------------
@@ -362,8 +369,10 @@ ADMIN_PATHS = {"/admin/plan", "/admin/whoami"}
 
 ADMIN_IP_ALLOWLIST = os.getenv("ADMIN_IP_ALLOWLIST", "").strip()
 
+
 def _sha256_12(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
 
 def _get_client_ip(request: Request) -> Optional[str]:
     try:
@@ -381,6 +390,7 @@ def _get_client_ip(request: Request) -> Optional[str]:
         return getattr(getattr(request, "client", None), "host", None)
     except Exception:
         return None
+
 
 def _ip_allowed(ip: Optional[str]) -> bool:
     if not ADMIN_IP_ALLOWLIST:
@@ -400,6 +410,7 @@ def _ip_allowed(ip: Optional[str]) -> bool:
     except Exception:
         return False
 
+
 def _require_admin(request: Request) -> Optional[JSONResponse]:
     admin_key = _get_admin_key()
     if not admin_key:
@@ -417,6 +428,7 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
 
     return None
 
+
 @app.get("/admin/whoami")
 def admin_whoami(request: Request):
     return {
@@ -427,16 +439,20 @@ def admin_whoami(request: Request):
         "cf_connecting_ip": request.headers.get("cf-connecting-ip"),
     }
 
+
 # -------------------------
 # Local (in-memory) rate limiter
 # -------------------------
 def _rate_limit_rps() -> float:
     return float(os.getenv("RATE_LIMIT_RPS", "3"))
 
+
 def _rate_limit_burst() -> float:
     return float(os.getenv("RATE_LIMIT_BURST", "10"))
 
+
 _local_buckets: dict[str, dict[str, float]] = {}
+
 
 def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> bool:
     rps = max(0.01, _rate_limit_rps())
@@ -458,26 +474,22 @@ def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> boo
         return True
     return False
 
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     endpoint = request.url.path
 
-    # ✅ Always allow browser preflight.
-    if request.method == "OPTIONS":
-        resp = Response(status_code=200)
-        return _add_cors_headers(resp, request)
+    # Do NOT intercept OPTIONS here.
+    # Lambda Function URL CORS handles preflight properly.
 
-    # Public endpoints: allow through, but STILL add CORS headers.
     if endpoint in PUBLIC_PATHS:
-        resp = await call_next(request)
-        return _add_cors_headers(resp, request)
+        return await call_next(request)
 
     if endpoint in ADMIN_PATHS:
         rej = _require_admin(request)
         if rej:
-            return _add_cors_headers(rej, request)
-        resp = await call_next(request)
-        return _add_cors_headers(resp, request)
+            return rej
+        return await call_next(request)
 
     api_key = _get_api_key()
     demo_key = os.getenv("DEMO_API_KEY", "").strip()
@@ -485,16 +497,14 @@ async def api_key_middleware(request: Request, call_next):
 
     if not api_key:
         _emit_metric("ApiKeyMisconfigured", 1, endpoint=endpoint)
-        resp = JSONResponse({"detail": "API key auth misconfigured (API_KEY missing)"}, status_code=500)
-        return _add_cors_headers(resp, request)
+        return JSONResponse({"detail": "API key auth misconfigured (API_KEY missing)"}, status_code=500)
 
     ok = (provided == api_key) or (demo_key and provided == demo_key)
 
     if not ok:
         _emit_metric("ApiKeyUnauthorized", 1, endpoint=endpoint, key_hash="unknown")
         _emit_metric("EndpointRequest", 1, endpoint=endpoint)
-        resp = JSONResponse({"detail": "Invalid API key"}, status_code=401)
-        return _add_cors_headers(resp, request)
+        return JSONResponse({"detail": "Invalid API key"}, status_code=401)
 
     request.state.key_hash = _sha256_12(provided)
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
@@ -506,7 +516,7 @@ async def api_key_middleware(request: Request, call_next):
         if not okq:
             used, reset_epoch = _quota_status(request.state.key_hash)
             remaining = max(0, int(limit) - int(used))
-            resp = _rl_json(
+            return _rl_json(
                 429,
                 {
                     "error": "quota_exceeded",
@@ -521,20 +531,17 @@ async def api_key_middleware(request: Request, call_next):
                 remaining=int(remaining),
                 reset_epoch=int(reset_epoch),
             )
-            return _add_cors_headers(resp, request)
 
     if not _global_allow_request(request.state.key_hash, endpoint, cost=1):
         window = max(1, int(_global_window_seconds()))
         reset_epoch = ((_epoch_s() // window) + 1) * window
-        resp = _rl_json(429, {"error": "rate_limited_global", "message": "Rate limit exceeded"}, reset_epoch=reset_epoch)
-        return _add_cors_headers(resp, request)
+        return _rl_json(429, {"error": "rate_limited_global", "message": "Rate limit exceeded"}, reset_epoch=reset_epoch)
 
     if not _local_allow_request(request.state.key_hash, endpoint, cost=1.0):
-        resp = _rl_json(429, {"error": "rate_limited_local", "message": "Rate limit exceeded"}, reset_epoch=_epoch_s() + 1)
-        return _add_cors_headers(resp, request)
+        return _rl_json(429, {"error": "rate_limited_local", "message": "Rate limit exceeded"}, reset_epoch=_epoch_s() + 1)
 
-    resp = await call_next(request)
-    return _add_cors_headers(resp, request)
+    return await call_next(request)
+
 
 # -------------------------------------------------------------------
 # ... rest of your file unchanged (routes, models, etc.)
