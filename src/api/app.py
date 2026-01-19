@@ -14,7 +14,6 @@ import boto3
 import httpx
 import pandas as pd
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from mangum import Mangum
 from pydantic import BaseModel, Field
@@ -22,24 +21,14 @@ from pydantic import BaseModel, Field
 from src.features.price_features import build_price_feature_set
 from src.models.signal_engine import generate_combined_signal, generate_rule_based_signal
 from src.utils.data_loader import load_price_data
-from src.utils.s3_store import (
-    cache_bucket,
-    cache_key,
-    read_latest_signal,
-    write_latest_signal,
-)
+from src.utils.s3_store import cache_bucket, cache_key, read_latest_signal, write_latest_signal
 
 app = FastAPI(title="Intellpulse API", version="0.2.10")
 
-# Keep CORSMiddleware (your current file has it). Lambda Function URL may also add CORS,
-# but this middleware ensures browser-friendly responses from FastAPI itself.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE:
+# We intentionally DO NOT use FastAPI CORSMiddleware here because Lambda Function URL
+# already injects CORS headers. Duplicating CORS headers can cause browsers to block
+# requests ("network/CORS") even when curl works.
 
 # -------------------------
 # AWS clients
@@ -49,10 +38,7 @@ _ddb = boto3.client("dynamodb")
 _sm = boto3.client("secretsmanager")
 
 METRICS_NS = os.getenv("METRICS_NAMESPACE", "Intellpulse/MVP1")
-SERVICE_NAME = os.getenv(
-    "SERVICE_NAME",
-    os.getenv("AWS_LAMBDA_FUNCTION_NAME", "intellpulse-api"),
-)
+SERVICE_NAME = os.getenv("SERVICE_NAME", os.getenv("AWS_LAMBDA_FUNCTION_NAME", "intellpulse-api"))
 
 
 def _emit_metric(name: str, value: float = 1.0, unit: str = "Count", **dims) -> None:
@@ -245,10 +231,7 @@ def _global_allow_request(key_hash: str, endpoint: str, cost: int = 1) -> bool:
 
     except Exception as e:
         # TEMP: fail-closed so we surface the real root cause
-        print(
-            "RATE_LIMIT_DEBUG_ERR "
-            + json.dumps({"err": repr(e), "pk": pk, "table": table})
-        )
+        print("RATE_LIMIT_DEBUG_ERR " + json.dumps({"err": repr(e), "pk": pk, "table": table}))
         raise
 
 
@@ -264,9 +247,7 @@ def _utc_yyyymmdd() -> str:
 
 def _next_midnight_utc_epoch(extra_minutes: int = 10) -> int:
     now = datetime.now(timezone.utc)
-    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(
-        days=1
-    )
+    tomorrow_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
     return int((tomorrow_midnight + timedelta(minutes=extra_minutes)).timestamp())
 
 
@@ -334,9 +315,7 @@ def _plan_get_limit(key_hash: str) -> tuple[str, int]:
         return ("pro", int(_quota_daily_limit_default()))
 
 
-def _quota_allow_request_with_limit(
-    key_hash: str, endpoint: str, daily_limit: int, cost: int = 1
-) -> bool:
+def _quota_allow_request_with_limit(key_hash: str, endpoint: str, daily_limit: int, cost: int = 1) -> bool:
     if not _quota_enabled():
         return True
 
@@ -380,11 +359,7 @@ def _quota_status(key_hash: str) -> tuple[int, int]:
     reset_epoch = _next_midnight_utc_epoch(extra_minutes=10)
 
     try:
-        resp = _ddb.get_item(
-            TableName=_quota_table(),
-            Key={"pk": {"S": pk}},
-            ConsistentRead=False,
-        )
+        resp = _ddb.get_item(TableName=_quota_table(), Key={"pk": {"S": pk}}, ConsistentRead=False)
         item = resp.get("Item") or {}
         if "n" in item and "N" in item["n"]:
             used = int(float(item["n"]["N"]))
@@ -440,7 +415,6 @@ def _get_client_ip(request: Request) -> Optional[str]:
     try:
         xff = request.headers.get("x-forwarded-for", "")
         if xff:
-            # "client, proxy1, proxy2" -> take first
             ip = xff.split(",")[0].strip()
             if ip:
                 return ip
@@ -453,7 +427,6 @@ def _get_client_ip(request: Request) -> Optional[str]:
         if xri:
             return xri
 
-        # last fallback
         return getattr(getattr(request, "client", None), "host", None)
     except Exception:
         return None
@@ -498,9 +471,6 @@ def _require_admin(request: Request) -> Optional[JSONResponse]:
 
 @app.get("/admin/whoami")
 def admin_whoami(request: Request):
-    """
-    Admin-only debug: shows what IP the server sees + forwarding headers.
-    """
     return {
         "client_ip": _get_client_ip(request),
         "request_client_host": getattr(getattr(request, "client", None), "host", None),
@@ -567,7 +537,7 @@ async def api_key_middleware(request: Request, call_next):
         return await call_next(request)
 
     api_key = _get_api_key()
-    demo_key = os.getenv("DEMO_API_KEY", "").strip()  # ✅ allow demo key
+    demo_key = os.getenv("DEMO_API_KEY", "").strip()
     provided = request.headers.get("x-api-key")
 
     # If API key isn't configured, don't block (helps bootstrap / local dev)
@@ -583,29 +553,21 @@ async def api_key_middleware(request: Request, call_next):
     _emit_metric("ApiKeyRequest", 1, endpoint=endpoint, key_hash=request.state.key_hash)
     _emit_metric("EndpointRequest", 1, endpoint=endpoint)
 
-    # Small debug breadcrumb (helps confirm env is being read)
     if endpoint == "/signal" and _global_rate_enabled():
         if int(time.time()) % 20 == 0:
             print(
-                f"RL_DEBUG enabled=1 rps={_global_rps()} burst={_global_burst()} window={_global_window_seconds()} table={_rate_table()}"
+                f"RL_DEBUG enabled=1 rps={_global_rps()} burst={_global_burst()} "
+                f"window={_global_window_seconds()} table={_rate_table()}"
             )
 
     # --- QUOTA (daily) ---
     if endpoint in BILLABLE_PATHS:
         plan, limit = _plan_get_limit(request.state.key_hash)
-        ok = _quota_allow_request_with_limit(
-            request.state.key_hash, endpoint, daily_limit=limit, cost=1
-        )
+        ok = _quota_allow_request_with_limit(request.state.key_hash, endpoint, daily_limit=limit, cost=1)
         if not ok:
             used, reset_epoch = _quota_status(request.state.key_hash)
             remaining = max(0, int(limit) - int(used))
-            _emit_metric(
-                "ApiKeyQuotaExceeded",
-                1,
-                endpoint=endpoint,
-                key_hash=request.state.key_hash,
-                plan=plan,
-            )
+            _emit_metric("ApiKeyQuotaExceeded", 1, endpoint=endpoint, key_hash=request.state.key_hash, plan=plan)
             return _rl_json(
                 429,
                 {
@@ -709,9 +671,7 @@ def admin_plan_upsert(payload: AdminPlanUpsertRequest, request: Request):
 
 
 @app.get("/admin/plan", response_model=AdminPlanResponse)
-def admin_plan_get(
-    request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None
-):
+def admin_plan_get(request: Request, api_key: Optional[str] = None, key_hash: Optional[str] = None):
     kh = _resolve_key_hash(api_key, key_hash)
     if not kh:
         return JSONResponse({"detail": "Provide api_key or key_hash"}, status_code=400)
@@ -722,17 +682,13 @@ def admin_plan_get(
     if not item:
         plan, limit = _plan_get_limit(kh)
         updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        return AdminPlanResponse(
-            key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at
-        )
+        return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=int(limit), updated_at=updated_at)
 
     plan = item.get("plan", {}).get("S", "pro")
     daily_limit = int(float(item.get("daily_limit", {}).get("N", str(_quota_daily_limit_default()))))
     updated_at = item.get("updated_at", {}).get("S", "")
 
-    return AdminPlanResponse(
-        key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at
-    )
+    return AdminPlanResponse(key_hash=kh, pk=pk, plan=plan, daily_limit=daily_limit, updated_at=updated_at)
 
 
 # -------------------------
@@ -954,17 +910,12 @@ class BacktestResponse(BaseModel):
 def _call_generate_combined_signal(price_df: pd.DataFrame, sentiment_df: pd.DataFrame) -> pd.DataFrame:
     """
     Your current src/models/signal_engine.py defines:
-
       generate_combined_signal(price_df, sentiment_aligned, sentiment_col="sentiment_score") -> DataFrame
-
-    But earlier versions of app.py (or other branches) may call it differently.
-    This wrapper keeps app.py resilient and prevents 500s from signature drift.
+    This wrapper keeps app.py resilient to minor signature drift.
     """
     try:
-        # Current expected signature (positional)
         return generate_combined_signal(price_df, sentiment_df)
     except TypeError:
-        # Fallback: some variants used keyword args
         return generate_combined_signal(price_df=price_df, sentiment_aligned=sentiment_df)
 
 
@@ -977,11 +928,7 @@ def health():
 
 
 @app.get("/signal", response_model=SignalResponse)
-def get_signal(
-    asset: str = "BTC-USD",
-    mode: Literal["price_only", "combined"] = "combined",
-    explain: int = 0,
-):
+def get_signal(asset: str = "BTC-USD", mode: Literal["price_only", "combined"] = "combined", explain: int = 0):
     t0 = time.time()
     _emit_metric("SignalRequest", 1, asset=asset, mode=mode)
 
@@ -1003,13 +950,7 @@ def get_signal(
                 _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
             _emit_metric("CacheFresh", 1, unit="Count", asset=asset, mode=mode)
 
-            _emit_metric(
-                "SignalLatencyMs",
-                (time.time() - t0) * 1000,
-                unit="Milliseconds",
-                asset=asset,
-                mode=mode,
-            )
+            _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
             return SignalResponse(
                 asset=asset,
                 mode=mode,
@@ -1034,7 +975,7 @@ def get_signal(
 
         if mode == "combined":
             sent = _load_aligned_sentiment(asset, price_sig)
-            combined = _call_generate_combined_signal(price_sig, sent)  # ✅ use wrapper
+            combined = _call_generate_combined_signal(price_sig, sent)
             latest_signal = int(combined["signal_combined"].iloc[-1])
             latest_sentiment = float(combined["sentiment_score"].iloc[-1])
 
@@ -1070,13 +1011,7 @@ def get_signal(
             except Exception:
                 _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
 
-        _emit_metric(
-            "SignalLatencyMs",
-            (time.time() - t0) * 1000,
-            unit="Milliseconds",
-            asset=asset,
-            mode=mode,
-        )
+        _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
         return resp
 
     except Exception as e:
@@ -1145,7 +1080,7 @@ def backtest(
 
         if mode == "combined":
             sent = _load_aligned_sentiment(asset, df)
-            df = _call_generate_combined_signal(df, sent)  # ✅ use wrapper
+            df = _call_generate_combined_signal(df, sent)
             signal_col = "signal_combined"
 
         if "close" not in df.columns or signal_col not in df.columns:
@@ -1210,13 +1145,7 @@ def backtest(
             buy_hold_equity_end=bh_end,
         )
 
-        _emit_metric(
-            "BacktestLatencyMs",
-            (time.time() - t0) * 1000,
-            unit="Milliseconds",
-            asset=asset,
-            mode=mode,
-        )
+        _emit_metric("BacktestLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
         return resp
 
     except Exception as e:
