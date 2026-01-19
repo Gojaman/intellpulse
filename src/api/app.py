@@ -8,14 +8,14 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional
 
 import boto3
 import httpx
 import pandas as pd
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from mangum import Mangum
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,8 @@ from src.utils.s3_store import (
 
 app = FastAPI(title="Intellpulse API", version="0.2.10")
 
+# Keep CORSMiddleware (your current file has it). Lambda Function URL may also add CORS,
+# but this middleware ensures browser-friendly responses from FastAPI itself.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -85,7 +87,7 @@ ADMIN_KEY_SECRET_ARN = os.getenv("ADMIN_KEY_SECRET_ARN", "").strip()
 @lru_cache(maxsize=32)
 def _get_secret_string(secret_id: str) -> str:
     """
-    Fetches a secret from AWS Secrets Manager.
+    Fetch a secret from AWS Secrets Manager.
     Supports:
       - raw SecretString (e.g. "abc123")
       - JSON SecretString like {"value":"abc123"} / {"key":"abc123"} / {"secret":"abc123"}
@@ -543,6 +545,14 @@ def _local_allow_request(key_hash: str, endpoint: str, cost: float = 1.0) -> boo
     return False
 
 
+# -------------------------
+# IMPORTANT: catch-all OPTIONS (helps some browser preflights)
+# -------------------------
+@app.options("/{path:path}")
+def options_any(path: str):
+    return Response(status_code=200)
+
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     endpoint = request.url.path
@@ -557,12 +567,14 @@ async def api_key_middleware(request: Request, call_next):
         return await call_next(request)
 
     api_key = _get_api_key()
+    demo_key = os.getenv("DEMO_API_KEY", "").strip()  # ✅ allow demo key
     provided = request.headers.get("x-api-key")
 
-    if not api_key:
+    # If API key isn't configured, don't block (helps bootstrap / local dev)
+    if not api_key and not demo_key:
         return await call_next(request)
 
-    if provided != api_key:
+    if not provided or (provided != api_key and (not demo_key or provided != demo_key)):
         _emit_metric("ApiKeyUnauthorized", 1, endpoint=endpoint, key_hash="unknown")
         _emit_metric("EndpointRequest", 1, endpoint=endpoint)
         return JSONResponse({"detail": "Invalid API key"}, status_code=401)
@@ -573,7 +585,6 @@ async def api_key_middleware(request: Request, call_next):
 
     # Small debug breadcrumb (helps confirm env is being read)
     if endpoint == "/signal" and _global_rate_enabled():
-        # keep it low-noise: only occasionally
         if int(time.time()) % 20 == 0:
             print(
                 f"RL_DEBUG enabled=1 rps={_global_rps()} burst={_global_burst()} window={_global_window_seconds()} table={_rate_table()}"
@@ -938,6 +949,26 @@ class BacktestResponse(BaseModel):
 
 
 # -------------------------
+# Combined-signal wrapper (handles signature mismatches safely)
+# -------------------------
+def _call_generate_combined_signal(price_df: pd.DataFrame, sentiment_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Your current src/models/signal_engine.py defines:
+
+      generate_combined_signal(price_df, sentiment_aligned, sentiment_col="sentiment_score") -> DataFrame
+
+    But earlier versions of app.py (or other branches) may call it differently.
+    This wrapper keeps app.py resilient and prevents 500s from signature drift.
+    """
+    try:
+        # Current expected signature (positional)
+        return generate_combined_signal(price_df, sentiment_df)
+    except TypeError:
+        # Fallback: some variants used keyword args
+        return generate_combined_signal(price_df=price_df, sentiment_aligned=sentiment_df)
+
+
+# -------------------------
 # Routes
 # -------------------------
 @app.get("/health")
@@ -972,7 +1003,13 @@ def get_signal(
                 _emit_metric("CacheAgeSeconds", age, unit="Seconds", asset=asset, mode=mode)
             _emit_metric("CacheFresh", 1, unit="Count", asset=asset, mode=mode)
 
-            _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+            _emit_metric(
+                "SignalLatencyMs",
+                (time.time() - t0) * 1000,
+                unit="Milliseconds",
+                asset=asset,
+                mode=mode,
+            )
             return SignalResponse(
                 asset=asset,
                 mode=mode,
@@ -997,7 +1034,7 @@ def get_signal(
 
         if mode == "combined":
             sent = _load_aligned_sentiment(asset, price_sig)
-            combined = generate_combined_signal(price_sig, sent)
+            combined = _call_generate_combined_signal(price_sig, sent)  # ✅ use wrapper
             latest_signal = int(combined["signal_combined"].iloc[-1])
             latest_sentiment = float(combined["sentiment_score"].iloc[-1])
 
@@ -1033,7 +1070,13 @@ def get_signal(
             except Exception:
                 _emit_metric("CacheWriteError", 1, asset=asset, mode=mode)
 
-        _emit_metric("SignalLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+        _emit_metric(
+            "SignalLatencyMs",
+            (time.time() - t0) * 1000,
+            unit="Milliseconds",
+            asset=asset,
+            mode=mode,
+        )
         return resp
 
     except Exception as e:
@@ -1102,7 +1145,7 @@ def backtest(
 
         if mode == "combined":
             sent = _load_aligned_sentiment(asset, df)
-            df = generate_combined_signal(df, sent)
+            df = _call_generate_combined_signal(df, sent)  # ✅ use wrapper
             signal_col = "signal_combined"
 
         if "close" not in df.columns or signal_col not in df.columns:
@@ -1167,7 +1210,13 @@ def backtest(
             buy_hold_equity_end=bh_end,
         )
 
-        _emit_metric("BacktestLatencyMs", (time.time() - t0) * 1000, unit="Milliseconds", asset=asset, mode=mode)
+        _emit_metric(
+            "BacktestLatencyMs",
+            (time.time() - t0) * 1000,
+            unit="Milliseconds",
+            asset=asset,
+            mode=mode,
+        )
         return resp
 
     except Exception as e:
